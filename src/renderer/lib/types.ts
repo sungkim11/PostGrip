@@ -98,6 +98,45 @@ export interface DdlResult {
   ddl: string;
 }
 
+export interface ModifyTableColumn {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  defaultValue: Nullable<string>;
+}
+
+export interface ModifyTableInfo {
+  schema: string;
+  table: string;
+  columns: ModifyTableColumn[];
+}
+
+export interface EditableTableData {
+  columns: string[];
+  columnTypes: string[];
+  rows: (string | null)[][];
+  primaryKeyColumns: string[];
+  totalCount: number;
+}
+
+export interface DmlOperation {
+  type: 'update' | 'insert' | 'delete';
+  pkValues?: Record<string, string | null>;
+  changes?: Record<string, string | null>;
+  values?: Record<string, string | null>;
+  columnTypes?: Record<string, string>;
+}
+
+export interface AlterTableAction {
+  type: 'add_column' | 'drop_column' | 'rename_column' | 'alter_type' | 'set_not_null' | 'drop_not_null' | 'set_default' | 'drop_default' | 'rename_table';
+  columnName?: string;
+  newColumnName?: string;
+  dataType?: string;
+  nullable?: boolean;
+  defaultValue?: string | null;
+  newTableName?: string;
+}
+
 export interface QueryResult {
   columns: string[];
   rows: string[][];

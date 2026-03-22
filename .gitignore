@@ -2,3 +2,5 @@ node_modules/
 .vite/
 out/
 dist/
+release/
+.env

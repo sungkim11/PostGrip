@@ -1,4 +1,4 @@
-import type { ActiveQuery, AppSnapshot, ConnectionInput, DdlResult, HostStats, QueryResult } from './types';
+import type { ActiveQuery, AlterTableAction, AppSnapshot, ConnectionInput, DdlResult, DmlOperation, EditableTableData, HostStats, ModifyTableInfo, QueryResult } from './types';
 
 interface ElectronAPI {
   bootstrap(): Promise<AppSnapshot>;
@@ -12,7 +12,14 @@ interface ElectronAPI {
   runQuery(sql: string, limit?: number): Promise<QueryResult>;
   previewTable(schema: string, table: string, limit?: number, offset?: number): Promise<QueryResult>;
   getTableDdl(schema: string, table: string): Promise<DdlResult>;
-  exportParquet(schema: string, table: string, path: string): Promise<number>;
+  dropTable(schema: string, table: string, cascade: boolean): Promise<AppSnapshot>;
+  truncateTable(schema: string, table: string, cascade: boolean): Promise<AppSnapshot>;
+  getEditableTableData(schema: string, table: string, limit: number, offset: number): Promise<EditableTableData>;
+  executeDml(schema: string, table: string, operations: DmlOperation[]): Promise<void>;
+  getModifyTableInfo(schema: string, table: string): Promise<ModifyTableInfo>;
+  alterTable(schema: string, table: string, actions: AlterTableAction[]): Promise<AppSnapshot>;
+  exportTableCsv(schema: string, table: string, path: string): Promise<number>;
+  exportPgDump(schema: string, table: string, filePath: string, format: string): Promise<void>;
   showSaveDialog(options: { defaultPath?: string; filters?: Array<{ name: string; extensions: string[] }> }): Promise<string | null>;
   writeFile(filePath: string, content: string): Promise<void>;
   closeWindow(): Promise<void>;

@@ -4,12 +4,17 @@ import { api } from '../lib/api';
 import { SqlEditor } from './SqlEditor';
 import type {
   ActiveConnectionSummary,
+  AlterTableAction,
   AppSnapshot,
   ConnectionInput,
   DdlResult,
+  DmlOperation,
+  EditableTableData,
   HostStats,
   IndexNode,
   KeyNode,
+  ModifyTableColumn,
+  ModifyTableInfo,
   QueryResult,
   SafeSavedConnection,
   SchemaNode,
@@ -49,9 +54,19 @@ interface QueryHistoryEntry {
 
 type TopMenu = 'file' | 'view' | null;
 
+type EditDataState = {
+  tableData: EditableTableData;
+  editedCells: Map<string, string | null>; // "rowIdx:colIdx" -> new value
+  deletedRows: Set<number>; // original row indexes
+  newRows: Array<(string | null)[]>; // added rows
+  editingCell: { row: number; col: number; isNew: boolean } | null;
+  page: number;
+  pageSize: number;
+};
+
 type EditorTab = {
   id: string;
-  kind: 'query' | 'table' | 'ddl';
+  kind: 'query' | 'table' | 'ddl' | 'editdata';
   title: string;
   sql: string;
   source?: { schema: string; table: string };
@@ -59,6 +74,7 @@ type EditorTab = {
   currentPage: number;
   result: QueryResult | null;
   ddlText?: string;
+  editData?: EditDataState;
 };
 
 type ContextMenuState = {
@@ -77,6 +93,12 @@ type ConnectionContextMenuState = {
 type ConfirmDialogState = {
   message: string;
   onConfirm: () => void;
+} | null;
+
+type DestructiveTableDialogState = {
+  action: 'drop' | 'truncate';
+  schema: string;
+  table: string;
 } | null;
 
 type SqlTab = {
@@ -135,6 +157,11 @@ export function AppShell() {
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [connectionContextMenu, setConnectionContextMenu] = useState<ConnectionContextMenuState>(null);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState>(null);
+  const [destructiveTableDialog, setDestructiveTableDialog] = useState<DestructiveTableDialogState>(null);
+  const [destructiveCascade, setDestructiveCascade] = useState(false);
+  const [modifyTableInfo, setModifyTableInfo] = useState<ModifyTableInfo | null>(null);
+  const [modifyTableDraft, setModifyTableDraft] = useState<{ columns: ModifyTableColumn[]; newTableName: string; addColumns: Array<{ name: string; dataType: string; nullable: boolean; defaultValue: string }>; dropColumns: Set<string> }>({ columns: [], newTableName: '', addColumns: [], dropColumns: new Set() });
+  const [modifyTableError, setModifyTableError] = useState('');
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'fail'>('idle');
   const [testError, setTestError] = useState('');
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
@@ -151,6 +178,20 @@ export function AppShell() {
   );
 
   const databaseTree = snapshot?.databaseTree ?? [];
+
+  const destructiveTableHasDependents = useMemo(() => {
+    if (!destructiveTableDialog) return false;
+    const qualifiedName = `${destructiveTableDialog.schema}.${destructiveTableDialog.table}`;
+    for (const schema of databaseTree) {
+      for (const table of schema.tables) {
+        if (schema.name === destructiveTableDialog.schema && table.name === destructiveTableDialog.table) continue;
+        for (const key of table.keys) {
+          if (key.type === 'FOREIGN KEY' && key.referencedTable === qualifiedName) return true;
+        }
+      }
+    }
+    return false;
+  }, [destructiveTableDialog, databaseTree]);
 
   const activeSqlTab = useMemo(
     () => sqlTabs.find((t) => t.id === activeSqlTabId) ?? sqlTabs[0] ?? null,
@@ -401,28 +442,61 @@ export function AppShell() {
     }
   }
 
-  function exportCurrentResult() {
-    if (!processedResult) {
-      return;
-    }
+  function getResultForExport() {
+    if (!activeEditorTab?.result) return null;
+    return activeEditorTab.result;
+  }
 
-    const header = ['#', ...processedResult.columns];
-    const rows = processedResult.rows.map((row, index) => [String(index + 1), ...row]);
-    const csv = [header, ...rows]
-      .map((row) =>
-        row
-          .map((cell) => `"${String(cell).replaceAll('"', '""')}"`)
-          .join(','),
-      )
+  function exportCurrentResult() {
+    exportResultAsCsv();
+  }
+
+  async function exportResultAsCsv() {
+    const result = getResultForExport();
+    if (!result) return;
+
+    const csv = [result.columns, ...result.rows]
+      .map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(','))
       .join('\n');
 
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${activeEditorTab?.title ?? 'results'}.csv`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    const path = await api.showSaveDialog({
+      defaultPath: `query_results.csv`,
+      filters: [{ name: 'CSV Files', extensions: ['csv'] }],
+    });
+    if (path) {
+      await api.writeFile(path, csv);
+      setLoading('Exported to CSV.');
+      setTimeout(() => setLoading(''), 2000);
+    }
+  }
+
+  async function exportResultAsExcel() {
+    const result = getResultForExport();
+    if (!result) return;
+
+    // Build a simple XML spreadsheet (Excel-compatible)
+    const escXml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const headerRow = result.columns.map((c) => `<Cell><Data ss:Type="String">${escXml(c)}</Data></Cell>`).join('');
+    const dataRows = result.rows.map((row) => {
+      const cells = row.map((cell) => {
+        const isNum = cell !== 'NULL' && !isNaN(Number(cell)) && cell.trim() !== '';
+        const type = isNum ? 'Number' : 'String';
+        return `<Cell><Data ss:Type="${type}">${escXml(cell)}</Data></Cell>`;
+      }).join('');
+      return `<Row>${cells}</Row>`;
+    }).join('\n');
+
+    const xml = `<?xml version="1.0"?>\n<?mso-application progid="Excel.Sheet"?>\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"\n xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">\n<Worksheet ss:Name="Results"><Table>\n<Row>${headerRow}</Row>\n${dataRows}\n</Table></Worksheet></Workbook>`;
+
+    const path = await api.showSaveDialog({
+      defaultPath: `query_results.xls`,
+      filters: [{ name: 'Excel Files', extensions: ['xls', 'xlsx'] }],
+    });
+    if (path) {
+      await api.writeFile(path, xml);
+      setLoading('Exported to Excel.');
+      setTimeout(() => setLoading(''), 2000);
+    }
   }
 
   function openNewConnectionModal() {
@@ -623,18 +697,70 @@ export function AppShell() {
     }
   }
 
-  async function handleExportParquet(schema: string, table: string) {
+  async function handleExportFullTableCsv(schema: string, table: string) {
     try {
       const path = await api.showSaveDialog({
-        defaultPath: `${schema}.${table}.parquet`,
-        filters: [{ name: 'Parquet Files', extensions: ['parquet'] }],
+        defaultPath: `${schema}.${table}.csv`,
+        filters: [{ name: 'CSV Files', extensions: ['csv'] }],
       });
       if (!path) return;
-      setLoading(`Exporting ${schema}.${table} to Parquet...`);
+      setLoading(`Exporting ${schema}.${table} (full table)...`);
       setError(null);
-      const rowCount = await api.exportParquet(schema, table, path);
-      setLoading(`Exported ${rowCount} rows to Parquet.`);
+      const rowCount = await api.exportTableCsv(schema, table, path);
+      setLoading(`Exported ${rowCount} rows.`);
       setTimeout(() => setLoading(''), 3000);
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleExportPgDump(schema: string, table: string) {
+    try {
+      const path = await api.showSaveDialog({
+        defaultPath: `${schema}.${table}.sql`,
+        filters: [
+          { name: 'SQL Files', extensions: ['sql'] },
+          { name: 'Custom Format', extensions: ['dump'] },
+          { name: 'Tar Archive', extensions: ['tar'] },
+        ],
+      });
+      if (!path) return;
+      const ext = path.split('.').pop()?.toLowerCase();
+      const format = ext === 'dump' ? 'custom' : ext === 'tar' ? 'tar' : 'sql';
+      setLoading(`Running pg_dump for ${schema}.${table}...`);
+      setError(null);
+      await api.exportPgDump(schema, table, path, format);
+      setLoading(`pg_dump export complete.`);
+      setTimeout(() => setLoading(''), 3000);
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleDropTable(schema: string, table: string, cascade: boolean) {
+    try {
+      setLoading(`Dropping ${schema}.${table}${cascade ? ' (CASCADE)' : ''}...`);
+      setError(null);
+      const next = await api.dropTable(schema, table, cascade);
+      setSnapshot(next);
+      // Close any editor tabs referencing this table
+      setEditorTabs((tabs) => tabs.filter((t) => !(t.source?.schema === schema && t.source?.table === table)));
+      setLoading('');
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleTruncateTable(schema: string, table: string, cascade: boolean) {
+    try {
+      setLoading(`Truncating ${schema}.${table}${cascade ? ' (CASCADE)' : ''}...`);
+      setError(null);
+      const next = await api.truncateTable(schema, table, cascade);
+      setSnapshot(next);
+      setLoading('');
     } catch (err) {
       setLoading('');
       setError(errorMessage(err));
@@ -679,6 +805,367 @@ export function AppShell() {
     } catch (err) {
       setLoading('');
       setError(errorMessage(err));
+    }
+  }
+
+  async function handleOpenEditData(schema: string, table: string) {
+    try {
+      setLoading(`Loading editable data for ${schema}.${table}...`);
+      setError(null);
+      const pageSize = 200;
+      const tableData = await api.getEditableTableData(schema, table, pageSize, 0);
+
+      if (tableData.primaryKeyColumns.length === 0) {
+        setLoading('');
+        setError(`Cannot edit data: table ${schema}.${table} has no primary key.`);
+        return;
+      }
+
+      const editState: EditDataState = {
+        tableData,
+        editedCells: new Map(),
+        deletedRows: new Set(),
+        newRows: [],
+        editingCell: null,
+        page: 0,
+        pageSize,
+      };
+
+      const existing = editorTabs.find((tab) => tab.kind === 'editdata' && tab.source?.schema === schema && tab.source?.table === table);
+      if (existing) {
+        setEditorTabs((current) =>
+          current.map((tab) =>
+            tab.id === existing.id
+              ? { ...tab, editData: editState, title: `Edit ${schema}.${table}` }
+              : tab,
+          ),
+        );
+        setActiveEditorTabId(existing.id);
+      } else {
+        const id = makeTabId('editdata');
+        setEditorTabs((current) => [
+          ...current,
+          {
+            id,
+            kind: 'editdata',
+            title: `Edit ${schema}.${table}`,
+            sql: '',
+            source: { schema, table },
+            result: null,
+            sortState: null,
+            currentPage: 0,
+            editData: editState,
+          },
+        ]);
+        setActiveEditorTabId(id);
+      }
+      setLoading('');
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  function updateEditData(patch: Partial<EditDataState>) {
+    if (!activeEditorTab?.editData) return;
+    setEditorTabs((current) =>
+      current.map((tab) =>
+        tab.id === activeEditorTab.id
+          ? { ...tab, editData: { ...tab.editData!, ...patch } }
+          : tab,
+      ),
+    );
+  }
+
+  function editDataSetCell(rowIdx: number, colIdx: number, value: string | null, isNew: boolean) {
+    if (!activeEditorTab?.editData) return;
+    if (isNew) {
+      const newRows = [...activeEditorTab.editData.newRows];
+      newRows[rowIdx] = [...newRows[rowIdx]];
+      newRows[rowIdx][colIdx] = value;
+      updateEditData({ newRows });
+    } else {
+      const edited = new Map(activeEditorTab.editData.editedCells);
+      const key = `${rowIdx}:${colIdx}`;
+      const original = activeEditorTab.editData.tableData.rows[rowIdx]?.[colIdx] ?? null;
+      if (value === original) {
+        edited.delete(key);
+      } else {
+        edited.set(key, value);
+      }
+      updateEditData({ editedCells: edited });
+    }
+  }
+
+  function editDataToggleDeleteRow(rowIdx: number) {
+    if (!activeEditorTab?.editData) return;
+    const deleted = new Set(activeEditorTab.editData.deletedRows);
+    if (deleted.has(rowIdx)) {
+      deleted.delete(rowIdx);
+    } else {
+      deleted.add(rowIdx);
+    }
+    updateEditData({ deletedRows: deleted });
+  }
+
+  function editDataAddRow() {
+    if (!activeEditorTab?.editData) return;
+    const cols = activeEditorTab.editData.tableData.columns;
+    const newRow: (string | null)[] = cols.map(() => null);
+    updateEditData({ newRows: [...activeEditorTab.editData.newRows, newRow] });
+  }
+
+  function editDataRemoveNewRow(idx: number) {
+    if (!activeEditorTab?.editData) return;
+    updateEditData({ newRows: activeEditorTab.editData.newRows.filter((_, i) => i !== idx) });
+  }
+
+  function editDataDiscard() {
+    if (!activeEditorTab?.editData) return;
+    updateEditData({
+      editedCells: new Map(),
+      deletedRows: new Set(),
+      newRows: [],
+      editingCell: null,
+    });
+  }
+
+  async function editDataApply() {
+    if (!activeEditorTab?.editData || !activeEditorTab.source) return;
+    const { schema, table } = activeEditorTab.source;
+    const { tableData, editedCells, deletedRows, newRows } = activeEditorTab.editData;
+    const { columns, columnTypes, primaryKeyColumns } = tableData;
+    const operations: DmlOperation[] = [];
+
+    // Build column name -> pg type map for proper casting
+    const colTypeMap: Record<string, string> = {};
+    for (let i = 0; i < columns.length; i++) {
+      colTypeMap[columns[i]] = columnTypes[i];
+    }
+
+    const pkIndexes = primaryKeyColumns.map((pk) => columns.indexOf(pk));
+
+    // Deletes
+    for (const rowIdx of deletedRows) {
+      const row = tableData.rows[rowIdx];
+      if (!row) continue;
+      const pkValues: Record<string, string | null> = {};
+      for (let pi = 0; pi < primaryKeyColumns.length; pi++) {
+        pkValues[primaryKeyColumns[pi]] = row[pkIndexes[pi]];
+      }
+      operations.push({ type: 'delete', pkValues });
+    }
+
+    // Updates - group edits by row
+    const editsByRow = new Map<number, Map<number, string | null>>();
+    for (const [key, val] of editedCells) {
+      const [r, c] = key.split(':').map(Number);
+      if (deletedRows.has(r)) continue;
+      if (!editsByRow.has(r)) editsByRow.set(r, new Map());
+      editsByRow.get(r)!.set(c, val);
+    }
+    for (const [rowIdx, cellChanges] of editsByRow) {
+      const row = tableData.rows[rowIdx];
+      if (!row) continue;
+      const pkValues: Record<string, string | null> = {};
+      for (let pi = 0; pi < primaryKeyColumns.length; pi++) {
+        pkValues[primaryKeyColumns[pi]] = row[pkIndexes[pi]];
+      }
+      const changes: Record<string, string | null> = {};
+      for (const [colIdx, val] of cellChanges) {
+        changes[columns[colIdx]] = val;
+      }
+      operations.push({ type: 'update', pkValues, changes, columnTypes: colTypeMap });
+    }
+
+    // Inserts
+    for (const newRow of newRows) {
+      const values: Record<string, string | null> = {};
+      let hasAnyValue = false;
+      for (let ci = 0; ci < columns.length; ci++) {
+        if (newRow[ci] !== null) {
+          values[columns[ci]] = newRow[ci];
+          hasAnyValue = true;
+        }
+      }
+      if (hasAnyValue) {
+        operations.push({ type: 'insert', values, columnTypes: colTypeMap });
+      }
+    }
+
+    if (operations.length === 0) return;
+
+    try {
+      setLoading('Applying changes...');
+      setError(null);
+      await api.executeDml(schema, table, operations);
+      // Reload data
+      const tableData = await api.getEditableTableData(schema, table, activeEditorTab.editData.pageSize, activeEditorTab.editData.page * activeEditorTab.editData.pageSize);
+      updateEditData({
+        tableData,
+        editedCells: new Map(),
+        deletedRows: new Set(),
+        newRows: [],
+        editingCell: null,
+      });
+      setLoading('');
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  async function editDataChangePage(newPage: number) {
+    if (!activeEditorTab?.editData || !activeEditorTab.source) return;
+    const { schema, table } = activeEditorTab.source;
+    const { pageSize } = activeEditorTab.editData;
+    try {
+      setLoading('Loading page...');
+      const tableData = await api.getEditableTableData(schema, table, pageSize, newPage * pageSize);
+      updateEditData({
+        tableData,
+        editedCells: new Map(),
+        deletedRows: new Set(),
+        newRows: [],
+        editingCell: null,
+        page: newPage,
+      });
+      setLoading('');
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleOpenModifyTable(schema: string, table: string) {
+    try {
+      setLoading(`Loading table info for ${schema}.${table}...`);
+      setError(null);
+      const info = await api.getModifyTableInfo(schema, table);
+      setModifyTableInfo(info);
+      setModifyTableDraft({
+        columns: info.columns.map((c) => ({ ...c })),
+        newTableName: info.table,
+        addColumns: [],
+        dropColumns: new Set(),
+      });
+      setModifyTableError('');
+      setLoading('');
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  function buildModifyActions(): AlterTableAction[] {
+    if (!modifyTableInfo) return [];
+    const actions: AlterTableAction[] = [];
+    const { table, columns: originalColumns } = modifyTableInfo;
+
+    if (modifyTableDraft.newTableName !== table) {
+      actions.push({ type: 'rename_table', newTableName: modifyTableDraft.newTableName });
+    }
+
+    for (const colName of modifyTableDraft.dropColumns) {
+      actions.push({ type: 'drop_column', columnName: colName });
+    }
+
+    for (let i = 0; i < originalColumns.length; i++) {
+      const orig = originalColumns[i];
+      const draft = modifyTableDraft.columns[i];
+      if (!draft || modifyTableDraft.dropColumns.has(orig.name)) continue;
+
+      if (draft.name !== orig.name) {
+        actions.push({ type: 'rename_column', columnName: orig.name, newColumnName: draft.name });
+      }
+      if (draft.dataType !== orig.dataType) {
+        actions.push({ type: 'alter_type', columnName: draft.name !== orig.name ? draft.name : orig.name, dataType: draft.dataType });
+      }
+      if (draft.nullable !== orig.nullable) {
+        actions.push({ type: draft.nullable ? 'drop_not_null' : 'set_not_null', columnName: draft.name !== orig.name ? draft.name : orig.name });
+      }
+      const origDefault = orig.defaultValue ?? '';
+      const draftDefault = draft.defaultValue ?? '';
+      if (draftDefault !== origDefault) {
+        if (draftDefault) {
+          actions.push({ type: 'set_default', columnName: draft.name !== orig.name ? draft.name : orig.name, defaultValue: draftDefault });
+        } else {
+          actions.push({ type: 'drop_default', columnName: draft.name !== orig.name ? draft.name : orig.name });
+        }
+      }
+    }
+
+    for (const col of modifyTableDraft.addColumns) {
+      if (!col.name.trim() || !col.dataType.trim()) continue;
+      actions.push({
+        type: 'add_column',
+        columnName: col.name,
+        dataType: col.dataType,
+        nullable: col.nullable,
+        defaultValue: col.defaultValue || null,
+      });
+    }
+
+    return actions;
+  }
+
+  const modifyPreviewDdl = useMemo(() => {
+    if (!modifyTableInfo) return '';
+    const rawActions = buildModifyActions();
+    if (rawActions.length === 0) return '-- No changes';
+    // Show rename last to match execution order
+    const actions = [...rawActions.filter((a) => a.type !== 'rename_table'), ...rawActions.filter((a) => a.type === 'rename_table')];
+    const qi = (v: string) => `"${v.replace(/"/g, '""')}"`;
+    const qt = `${qi(modifyTableInfo.schema)}.${qi(modifyTableInfo.table)}`;
+    return actions.map((a) => {
+      switch (a.type) {
+        case 'rename_table':
+          return `ALTER TABLE ${qt} RENAME TO ${qi(a.newTableName!)};`;
+        case 'drop_column':
+          return `ALTER TABLE ${qt} DROP COLUMN ${qi(a.columnName!)};`;
+        case 'rename_column':
+          return `ALTER TABLE ${qt} RENAME COLUMN ${qi(a.columnName!)} TO ${qi(a.newColumnName!)};`;
+        case 'alter_type':
+          return `ALTER TABLE ${qt} ALTER COLUMN ${qi(a.columnName!)} TYPE ${a.dataType!};`;
+        case 'set_not_null':
+          return `ALTER TABLE ${qt} ALTER COLUMN ${qi(a.columnName!)} SET NOT NULL;`;
+        case 'drop_not_null':
+          return `ALTER TABLE ${qt} ALTER COLUMN ${qi(a.columnName!)} DROP NOT NULL;`;
+        case 'set_default':
+          return `ALTER TABLE ${qt} ALTER COLUMN ${qi(a.columnName!)} SET DEFAULT ${a.defaultValue!};`;
+        case 'drop_default':
+          return `ALTER TABLE ${qt} ALTER COLUMN ${qi(a.columnName!)} DROP DEFAULT;`;
+        case 'add_column': {
+          let sql = `ALTER TABLE ${qt} ADD COLUMN ${qi(a.columnName!)} ${a.dataType!}`;
+          if (!a.nullable) sql += ' NOT NULL';
+          if (a.defaultValue) sql += ` DEFAULT ${a.defaultValue}`;
+          return sql + ';';
+        }
+        default:
+          return '';
+      }
+    }).join('\n');
+  }, [modifyTableInfo, modifyTableDraft]);
+
+  async function handleApplyModifyTable() {
+    if (!modifyTableInfo) return;
+    const actions = buildModifyActions();
+
+    if (actions.length === 0) {
+      setModifyTableInfo(null);
+      return;
+    }
+
+    try {
+      setLoading('Applying table modifications...');
+      setModifyTableError('');
+      const next = await api.alterTable(modifyTableInfo.schema, modifyTableInfo.table, actions);
+      setSnapshot(next);
+      setModifyTableInfo(null);
+      setLoading('');
+    } catch (err) {
+      setLoading('');
+      setModifyTableError(errorMessage(err));
     }
   }
 
@@ -872,6 +1359,7 @@ export function AppShell() {
                       value={sqlEditorText}
                       onChange={setSqlEditorText}
                       onRun={(text) => void handleRunQuery(text)}
+                      databaseTree={databaseTree}
                     />
                   </div>
                   <div className="flex w-[270px] shrink-0 flex-col gap-1 overflow-y-auto border-l border-black/5 px-2 py-1">
@@ -911,7 +1399,7 @@ export function AppShell() {
                       type="button"
                     >
                       <span className="text-[11px] text-gray-500">
-                        {tab.kind === 'table' ? <TableIcon /> : tab.kind === 'ddl' ? <DdlIcon /> : <QueryIcon />}
+                        {tab.kind === 'table' ? <TableIcon /> : tab.kind === 'ddl' ? <DdlIcon /> : tab.kind === 'editdata' ? <EditDataIcon /> : <QueryIcon />}
                       </span>
                       <span className="truncate font-sans text-[12px]">
                         {tab.title}
@@ -928,6 +1416,12 @@ export function AppShell() {
                     </button>
                   ))}
                 </div>
+                {activeEditorTab?.result ? (
+                  <div className="flex shrink-0 items-center gap-1 px-2">
+                    <button className="rounded border border-black/10 px-2 py-0.5 text-[10px] text-gray-500 hover:bg-gray-50 hover:text-black" onClick={() => void exportResultAsCsv()} type="button">CSV</button>
+                    <button className="rounded border border-black/10 px-2 py-0.5 text-[10px] text-gray-500 hover:bg-gray-50 hover:text-black" onClick={() => void exportResultAsExcel()} type="button">Excel</button>
+                  </div>
+                ) : null}
               </div>
 
               <div className="flex min-h-0 flex-1 flex-col rounded-b-xl bg-white">
@@ -935,6 +1429,18 @@ export function AppShell() {
                   <div className="min-h-0 flex-1 overflow-auto p-4">
                     <pre className="font-mono text-[13px] leading-relaxed text-black whitespace-pre">{activeEditorTab.ddlText}</pre>
                   </div>
+                ) : activeEditorTab?.kind === 'editdata' && activeEditorTab.editData ? (
+                  <EditDataView
+                    editData={activeEditorTab.editData}
+                    onCellChange={editDataSetCell}
+                    onToggleDeleteRow={editDataToggleDeleteRow}
+                    onAddRow={editDataAddRow}
+                    onRemoveNewRow={editDataRemoveNewRow}
+                    onApply={() => void editDataApply()}
+                    onDiscard={editDataDiscard}
+                    onSetEditingCell={(cell) => updateEditData({ editingCell: cell })}
+                    onPageChange={(p) => void editDataChangePage(p)}
+                  />
                 ) : processedResult ? (
                   <>
                     <div className="min-h-0 flex-1 overflow-scroll">
@@ -976,10 +1482,22 @@ export function AppShell() {
           onContextMenu={(event) => { event.preventDefault(); setContextMenu(null); }}
         >
           <div
-            className="glass-panel-strong absolute min-w-[180px] rounded-xl py-1 shadow-lg"
+            className="context-menu absolute min-w-[180px] rounded-xl py-1"
             style={{ left: contextMenu.x, top: contextMenu.y }}
             onClick={(event) => event.stopPropagation()}
           >
+            <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-black hover:bg-white/40"
+              onClick={() => {
+                setContextMenu(null);
+                void refresh();
+              }}
+              type="button"
+            >
+              <span className="text-gray-500"><RefreshIcon /></span>
+              Refresh
+            </button>
+            <div className="mx-2 my-1 border-t border-black/5" />
             <button
               className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-black hover:bg-white/40"
               onClick={() => {
@@ -997,6 +1515,19 @@ export function AppShell() {
               onClick={() => {
                 const { schema, table } = contextMenu;
                 setContextMenu(null);
+                void handleOpenEditData(schema, table);
+              }}
+              type="button"
+            >
+              <span className="text-gray-500"><EditDataIcon /></span>
+              Edit Data
+            </button>
+            <div className="mx-2 my-1 border-t border-black/5" />
+            <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-black hover:bg-white/40"
+              onClick={() => {
+                const { schema, table } = contextMenu;
+                setContextMenu(null);
                 void handleExportTable(schema, table);
               }}
               type="button"
@@ -1009,12 +1540,64 @@ export function AppShell() {
               onClick={() => {
                 const { schema, table } = contextMenu;
                 setContextMenu(null);
-                void handleExportParquet(schema, table);
+                void handleExportFullTableCsv(schema, table);
               }}
               type="button"
             >
               <span className="text-gray-500"><ExportIcon /></span>
-              Export Parquet
+              Export CSV (full table)
+            </button>
+            <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-black hover:bg-white/40"
+              onClick={() => {
+                const { schema, table } = contextMenu;
+                setContextMenu(null);
+                void handleExportPgDump(schema, table);
+              }}
+              type="button"
+            >
+              <span className="text-gray-500"><ExportIcon /></span>
+              Export with pg_dump
+            </button>
+            <div className="mx-2 my-1 border-t border-black/5" />
+            <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-black hover:bg-white/40"
+              onClick={() => {
+                const { schema, table } = contextMenu;
+                setContextMenu(null);
+                void handleOpenModifyTable(schema, table);
+              }}
+              type="button"
+            >
+              <span className="text-gray-500"><ModifyIcon /></span>
+              Modify Table
+            </button>
+            <div className="mx-2 my-1 border-t border-black/5" />
+            <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-red-500 hover:bg-red-50"
+              onClick={() => {
+                const { schema, table } = contextMenu;
+                setContextMenu(null);
+                setDestructiveCascade(false);
+                setDestructiveTableDialog({ action: 'truncate', schema, table });
+              }}
+              type="button"
+            >
+              <span className="text-red-400"><TruncateIcon /></span>
+              Truncate Table
+            </button>
+            <button
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] text-red-600 hover:bg-red-50"
+              onClick={() => {
+                const { schema, table } = contextMenu;
+                setContextMenu(null);
+                setDestructiveCascade(false);
+                setDestructiveTableDialog({ action: 'drop', schema, table });
+              }}
+              type="button"
+            >
+              <span className="text-red-500"><DropIcon /></span>
+              Drop Table
             </button>
           </div>
         </div>
@@ -1027,7 +1610,7 @@ export function AppShell() {
           onContextMenu={(event) => { event.preventDefault(); setConnectionContextMenu(null); }}
         >
           <div
-            className="glass-panel-strong absolute min-w-[160px] rounded-xl py-1 shadow-lg"
+            className="context-menu absolute min-w-[160px] rounded-xl py-1"
             style={{ left: connectionContextMenu.x, top: connectionContextMenu.y }}
             onClick={(event) => event.stopPropagation()}
           >
@@ -1060,13 +1643,320 @@ export function AppShell() {
         </div>
       ) : null}
 
+      {destructiveTableDialog ? (() => {
+        const { action, schema, table } = destructiveTableDialog;
+        const isDrop = action === 'drop';
+        const title = isDrop ? 'Drop Table' : 'Truncate Table';
+        const sqlPreview = isDrop
+          ? `DROP TABLE ${schema}.${table}${destructiveCascade ? ' CASCADE' : ''};`
+          : `TRUNCATE TABLE ${schema}.${table}${destructiveCascade ? ' CASCADE' : ''};`;
+        return (
+          <div className="fixed inset-0 z-40 grid place-items-center bg-black/20 backdrop-blur-sm p-4">
+            <div className="glass-panel-strong w-full max-w-sm rounded-2xl shadow-xl">
+              <div className="flex items-center gap-3 border-b border-black/5 px-5 py-3">
+                <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-red-100 text-red-600">
+                  <WarningIcon />
+                </span>
+                <div className="text-[13px] font-medium text-black">{title}</div>
+              </div>
+              <div className="px-5 py-4">
+                <div className="text-[13px] text-black">
+                  {isDrop
+                    ? <>This will permanently delete <span className="font-semibold">{schema}.{table}</span> and all its data. This action cannot be undone.</>
+                    : <>This will permanently delete all data in <span className="font-semibold">{schema}.{table}</span>. The table structure will be preserved. This action cannot be undone.</>
+                  }
+                </div>
+                <label className={classNames(
+                  'mt-4 flex items-center gap-2 rounded-lg border px-3 py-2 text-[12px]',
+                  destructiveTableHasDependents
+                    ? 'border-black/10 cursor-pointer hover:bg-gray-50'
+                    : 'border-black/5 opacity-40 cursor-not-allowed',
+                )}>
+                  <input
+                    type="checkbox"
+                    checked={destructiveCascade}
+                    disabled={!destructiveTableHasDependents}
+                    onChange={(e) => setDestructiveCascade(e.target.checked)}
+                  />
+                  <div>
+                    <div className="font-medium text-black">CASCADE</div>
+                    <div className="text-[11px] text-gray-500">
+                      {isDrop
+                        ? 'Also drop all dependent objects (views, foreign keys, etc.)'
+                        : 'Also truncate all tables that reference this table via foreign keys'}
+                    </div>
+                  </div>
+                </label>
+                {!destructiveTableHasDependents && (
+                  <div className="mt-1.5 text-[11px] text-gray-400">No other tables reference this table.</div>
+                )}
+                <pre className="mt-3 rounded-lg border border-black/10 bg-gray-50/80 px-3 py-2 font-mono text-[11px] text-gray-700">{sqlPreview}</pre>
+              </div>
+              <div className="flex justify-end gap-2 border-t border-black/5 px-5 py-3">
+                <button
+                  className="rounded-lg border border-black/10 px-3 py-1.5 text-[12px] text-gray-500 hover:text-black"
+                  onClick={() => setDestructiveTableDialog(null)}
+                  type="button"
+                >
+                  Cancel
+                </button>
+                <button
+                  className="rounded-lg bg-red-600 px-3 py-1.5 text-[12px] text-white hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/30"
+                  onClick={() => {
+                    setDestructiveTableDialog(null);
+                    if (isDrop) {
+                      void handleDropTable(schema, table, destructiveCascade);
+                    } else {
+                      void handleTruncateTable(schema, table, destructiveCascade);
+                    }
+                  }}
+                  type="button"
+                >
+                  {isDrop ? 'Drop Table' : 'Truncate Table'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })() : null}
+
       {confirmDialog ? (
         <div className="fixed inset-0 z-40 grid place-items-center bg-black/20 backdrop-blur-sm p-4">
           <div className="glass-panel-strong w-full max-w-xs rounded-2xl shadow-xl">
-            <div className="px-5 py-4 text-[13px] text-black">{confirmDialog.message}</div>
+            <div className="px-5 py-4 text-[13px] text-black whitespace-pre-line">{confirmDialog.message}</div>
             <div className="flex justify-end gap-2 border-t border-black/5 px-5 py-3">
               <button className="rounded-lg px-3 py-1 text-[12px] text-gray-500 hover:text-black" onClick={confirmDialog.onConfirm} type="button">Yes</button>
               <button autoFocus className="rounded-lg bg-[var(--accent)] px-3 py-1 text-[12px] text-white hover:opacity-90 focus:outline-none focus:ring-2 focus:ring-[var(--accent)]/30" onClick={() => setConfirmDialog(null)} type="button">No</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {modifyTableInfo ? (
+        <div className="fixed inset-0 z-40 grid place-items-center bg-black/20 backdrop-blur-sm p-4">
+          <div className="glass-panel-strong w-full max-w-2xl rounded-2xl shadow-xl max-h-[80vh] flex flex-col">
+            <div className="border-b border-black/5 px-5 py-3 shrink-0">
+              <div className="text-[13px] font-medium text-black">Modify Table — {modifyTableInfo.schema}.{modifyTableInfo.table}</div>
+            </div>
+            <div className="flex-1 overflow-auto p-5">
+              <div className="mb-4">
+                <Field label="Table Name">
+                  <input
+                    className="input"
+                    value={modifyTableDraft.newTableName}
+                    onChange={(e) => setModifyTableDraft((d) => ({ ...d, newTableName: e.target.value }))}
+                  />
+                </Field>
+              </div>
+
+              <div className="mb-3 text-[11px] font-medium uppercase tracking-[0.08em] text-black">Columns</div>
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-[12px]">
+                  <thead>
+                    <tr className="text-left text-[11px] font-medium uppercase tracking-[0.08em] text-gray-500">
+                      <th className="px-2 py-1.5 border-b border-black/10">Name</th>
+                      <th className="px-2 py-1.5 border-b border-black/10">Type</th>
+                      <th className="px-2 py-1.5 border-b border-black/10 text-center">Nullable</th>
+                      <th className="px-2 py-1.5 border-b border-black/10">Default</th>
+                      <th className="px-2 py-1.5 border-b border-black/10 w-8"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {modifyTableDraft.columns.map((col, i) => {
+                      const isDropped = modifyTableDraft.dropColumns.has(modifyTableInfo.columns[i].name);
+                      return (
+                        <tr key={modifyTableInfo.columns[i].name} className={isDropped ? 'opacity-30 line-through' : ''}>
+                          <td className="px-2 py-1 border-b border-black/5">
+                            <input
+                              className="input w-full"
+                              value={col.name}
+                              disabled={isDropped}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setModifyTableDraft((d) => {
+                                  const cols = [...d.columns];
+                                  cols[i] = { ...cols[i], name: val };
+                                  return { ...d, columns: cols };
+                                });
+                              }}
+                            />
+                          </td>
+                          <td className="px-2 py-1 border-b border-black/5">
+                            <input
+                              className="input w-full"
+                              value={col.dataType}
+                              disabled={isDropped}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setModifyTableDraft((d) => {
+                                  const cols = [...d.columns];
+                                  cols[i] = { ...cols[i], dataType: val };
+                                  return { ...d, columns: cols };
+                                });
+                              }}
+                            />
+                          </td>
+                          <td className="px-2 py-1 border-b border-black/5 text-center">
+                            <input
+                              type="checkbox"
+                              checked={col.nullable}
+                              disabled={isDropped}
+                              onChange={(e) => {
+                                const val = e.target.checked;
+                                setModifyTableDraft((d) => {
+                                  const cols = [...d.columns];
+                                  cols[i] = { ...cols[i], nullable: val };
+                                  return { ...d, columns: cols };
+                                });
+                              }}
+                            />
+                          </td>
+                          <td className="px-2 py-1 border-b border-black/5">
+                            <input
+                              className="input w-full"
+                              value={col.defaultValue ?? ''}
+                              disabled={isDropped}
+                              placeholder="none"
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setModifyTableDraft((d) => {
+                                  const cols = [...d.columns];
+                                  cols[i] = { ...cols[i], defaultValue: val || null };
+                                  return { ...d, columns: cols };
+                                });
+                              }}
+                            />
+                          </td>
+                          <td className="px-2 py-1 border-b border-black/5">
+                            <button
+                              className="text-[11px] text-red-400 hover:text-red-600"
+                              title={isDropped ? 'Undo drop' : 'Drop column'}
+                              onClick={() => {
+                                const origName = modifyTableInfo.columns[i].name;
+                                setModifyTableDraft((d) => {
+                                  const next = new Set(d.dropColumns);
+                                  if (next.has(origName)) {
+                                    next.delete(origName);
+                                  } else {
+                                    next.add(origName);
+                                  }
+                                  return { ...d, dropColumns: next };
+                                });
+                              }}
+                              type="button"
+                            >
+                              {isDropped ? 'undo' : 'drop'}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {modifyTableDraft.addColumns.map((col, i) => (
+                      <tr key={`new-${i}`} className="bg-emerald-50/40">
+                        <td className="px-2 py-1 border-b border-black/5">
+                          <input
+                            className="input w-full"
+                            value={col.name}
+                            placeholder="column_name"
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setModifyTableDraft((d) => {
+                                const adds = [...d.addColumns];
+                                adds[i] = { ...adds[i], name: val };
+                                return { ...d, addColumns: adds };
+                              });
+                            }}
+                          />
+                        </td>
+                        <td className="px-2 py-1 border-b border-black/5">
+                          <input
+                            className="input w-full"
+                            value={col.dataType}
+                            placeholder="text"
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setModifyTableDraft((d) => {
+                                const adds = [...d.addColumns];
+                                adds[i] = { ...adds[i], dataType: val };
+                                return { ...d, addColumns: adds };
+                              });
+                            }}
+                          />
+                        </td>
+                        <td className="px-2 py-1 border-b border-black/5 text-center">
+                          <input
+                            type="checkbox"
+                            checked={col.nullable}
+                            onChange={(e) => {
+                              const val = e.target.checked;
+                              setModifyTableDraft((d) => {
+                                const adds = [...d.addColumns];
+                                adds[i] = { ...adds[i], nullable: val };
+                                return { ...d, addColumns: adds };
+                              });
+                            }}
+                          />
+                        </td>
+                        <td className="px-2 py-1 border-b border-black/5">
+                          <input
+                            className="input w-full"
+                            value={col.defaultValue}
+                            placeholder="none"
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              setModifyTableDraft((d) => {
+                                const adds = [...d.addColumns];
+                                adds[i] = { ...adds[i], defaultValue: val };
+                                return { ...d, addColumns: adds };
+                              });
+                            }}
+                          />
+                        </td>
+                        <td className="px-2 py-1 border-b border-black/5">
+                          <button
+                            className="text-[11px] text-red-400 hover:text-red-600"
+                            title="Remove"
+                            onClick={() => {
+                              setModifyTableDraft((d) => ({
+                                ...d,
+                                addColumns: d.addColumns.filter((_, j) => j !== i),
+                              }));
+                            }}
+                            type="button"
+                          >
+                            remove
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <button
+                className="mt-2 rounded-lg border border-dashed border-black/10 px-3 py-1.5 text-[12px] text-gray-500 hover:border-black/20 hover:text-black"
+                onClick={() => {
+                  setModifyTableDraft((d) => ({
+                    ...d,
+                    addColumns: [...d.addColumns, { name: '', dataType: 'text', nullable: true, defaultValue: '' }],
+                  }));
+                }}
+                type="button"
+              >
+                + Add Column
+              </button>
+
+              <div className="mt-4">
+                <div className="mb-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-black">DDL Preview</div>
+                <pre className="max-h-[160px] overflow-auto rounded-lg border border-black/10 bg-gray-50/80 px-3 py-2 font-mono text-[11px] text-gray-700 whitespace-pre-wrap">{modifyPreviewDdl}</pre>
+              </div>
+
+              {modifyTableError ? (
+                <div className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-[12px] text-red-600">{modifyTableError}</div>
+              ) : null}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-black/5 px-5 py-3 shrink-0">
+              <button className="rounded-lg border border-black/10 px-3 py-1.5 text-[12px] text-gray-500 hover:text-black" onClick={() => setModifyTableInfo(null)} type="button">Cancel</button>
+              <button className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[12px] text-white hover:opacity-90" onClick={() => void handleApplyModifyTable()} type="button">Apply Changes</button>
             </div>
           </div>
         </div>
@@ -1432,10 +2322,10 @@ function ResultsTable({
                     <button className="flex-1 text-left" onClick={() => onSort(index)} type="button">
                       {column}
                     </button>
-                    <span className="shrink-0 text-gray-400"><FilterIcon /></span>
-                    <button className="inline-flex shrink-0 flex-col items-center gap-0 leading-[1] text-[7px]" onClick={() => onSort(index)} type="button">
-                      <span className={classNames('-mb-[4px]', sortState?.columnIndex === index && sortState.direction === 'asc' ? 'text-black' : 'text-white')} style={{ WebkitTextStroke: '0.5px #888' }}>&#9650;</span>
-                      <span className={classNames('-mt-[4px]', sortState?.columnIndex === index && sortState.direction === 'desc' ? 'text-black' : 'text-white')} style={{ WebkitTextStroke: '0.5px #888' }}>&#9660;</span>
+                    <span className="shrink-0 scale-75 text-gray-400"><FilterIcon /></span>
+                    <button className="inline-flex shrink-0 flex-col items-center gap-0 leading-[1] text-[4px]" onClick={() => onSort(index)} type="button">
+                      <span className={classNames('-mb-[2px]', sortState?.columnIndex === index && sortState.direction === 'asc' ? 'text-black' : 'text-white')} style={{ WebkitTextStroke: '0.3px #888' }}>&#9650;</span>
+                      <span className={classNames('-mt-[2px]', sortState?.columnIndex === index && sortState.direction === 'desc' ? 'text-black' : 'text-white')} style={{ WebkitTextStroke: '0.3px #888' }}>&#9660;</span>
                     </button>
                   </div>
                 </th>
@@ -1472,6 +2362,247 @@ function QueryIcon() { return <IconBase><path d="M4 4.5h8M4 8h8M4 11.5h5" stroke
 function ExportIcon() { return <IconBase><path d="M8 2.5v7M5.5 7l2.5 2.5L10.5 7" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round" /><path d="M3 12.5h10" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /></IconBase>; }
 function FilterIcon() { return <IconBase><path d="M2.5 3.5h11L9 8.5v4l-2 1.5v-5.5z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" /></IconBase>; }
 function DdlIcon() { return <IconBase><path d="M4 3h5.5L12 5.5V13H4z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" /><path d="M9.5 3v2.5H12" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" /><path d="M6 8h4M6 10h3" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" /></IconBase>; }
+function ModifyIcon() { return <IconBase><path d="M11.5 2.5l2 2-7 7H4.5v-2z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round" /><path d="M3 13.5h10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /></IconBase>; }
+function EditDataIcon() { return <IconBase><rect x="2.5" y="3" width="11" height="10" stroke="currentColor" strokeWidth="1.2" /><path d="M2.5 6.5h11M6 3v10" stroke="currentColor" strokeWidth="1" /><path d="M9.5 8.5l1.5 1.5-1.5 1.5" stroke="currentColor" strokeWidth="1" strokeLinecap="round" strokeLinejoin="round" /></IconBase>; }
+function TruncateIcon() { return <IconBase><path d="M3.5 5h9M5 5V4h6v1M5.5 5v7.5h5V5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" /><path d="M7 7.5v3M9 7.5v3" stroke="currentColor" strokeWidth="1" strokeLinecap="round" /></IconBase>; }
+function DropIcon() { return <IconBase><path d="M3.5 5h9M5 5V4h6v1M5.5 5v7.5h5V5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" /><path d="M6 8l4 4M10 8l-4 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" /></IconBase>; }
+function WarningIcon() { return <IconBase><path d="M8 2L1.5 13h13L8 2z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" fill="none" /><path d="M8 6v3.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" /><circle cx="8" cy="11" r="0.7" fill="currentColor" /></IconBase>; }
+
+function EditDataView({
+  editData,
+  onCellChange,
+  onToggleDeleteRow,
+  onAddRow,
+  onRemoveNewRow,
+  onApply,
+  onDiscard,
+  onSetEditingCell,
+  onPageChange,
+}: {
+  editData: EditDataState;
+  onCellChange: (rowIdx: number, colIdx: number, value: string | null, isNew: boolean) => void;
+  onToggleDeleteRow: (rowIdx: number) => void;
+  onAddRow: () => void;
+  onRemoveNewRow: (idx: number) => void;
+  onApply: () => void;
+  onDiscard: () => void;
+  onSetEditingCell: (cell: { row: number; col: number; isNew: boolean } | null) => void;
+  onPageChange: (page: number) => void;
+}) {
+  const { tableData, editedCells, deletedRows, newRows, editingCell, page, pageSize } = editData;
+  const { columns, columnTypes, rows, primaryKeyColumns, totalCount } = tableData;
+  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const hasChanges = editedCells.size > 0 || deletedRows.size > 0 || newRows.length > 0;
+  const changeCount = editedCells.size + deletedRows.size + newRows.filter((r) => r.some((v) => v !== null)).length;
+
+  return (
+    <>
+      <div className="flex shrink-0 items-center gap-2 border-b border-black/5 bg-white/30 px-3 py-1.5">
+        <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-gray-500">
+          PK: {primaryKeyColumns.join(', ')}
+        </span>
+        <span className="text-[11px] text-gray-400">|</span>
+        <span className="text-[11px] text-gray-500">{totalCount.toLocaleString()} rows total</span>
+        <div className="flex-1" />
+        {hasChanges ? (
+          <span className="rounded bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+            {changeCount} pending {changeCount === 1 ? 'change' : 'changes'}
+          </span>
+        ) : null}
+        <button
+          className="rounded-lg border border-black/10 px-2 py-1 text-[11px] text-gray-500 hover:text-black disabled:opacity-30"
+          disabled={!hasChanges}
+          onClick={onDiscard}
+          type="button"
+        >
+          Discard
+        </button>
+        <button
+          className="rounded-lg bg-[var(--accent)] px-2 py-1 text-[11px] text-white hover:opacity-90 disabled:opacity-30"
+          disabled={!hasChanges}
+          onClick={onApply}
+          type="button"
+        >
+          Apply
+        </button>
+        <button
+          className="rounded-lg border border-dashed border-black/10 px-2 py-1 text-[11px] text-gray-500 hover:border-black/20 hover:text-black"
+          onClick={onAddRow}
+          type="button"
+        >
+          + Row
+        </button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-scroll">
+        <div className="bg-transparent">
+          <table className="min-w-full border-collapse font-sans text-[12px]">
+            <thead className="sticky top-0 z-[1] bg-white/60 backdrop-blur-sm text-left text-black">
+              <tr>
+                <th className="w-10 border-b border-r border-black/8 px-2 py-1 font-medium text-center text-[10px] text-gray-400">#</th>
+                {columns.map((col, ci) => (
+                  <th className="border-b border-r border-black/8 px-2 py-1 font-medium" key={col}>
+                    <div className="flex items-center gap-1">
+                      <span>{col}</span>
+                      {primaryKeyColumns.includes(col) && <span className="text-[9px] text-amber-500">PK</span>}
+                      <span className="ml-auto text-[10px] font-normal text-gray-400">{columnTypes[ci]}</span>
+                    </div>
+                  </th>
+                ))}
+                <th className="w-12 border-b border-black/8 px-1 py-1 font-medium text-center text-[10px] text-gray-400">
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIdx) => {
+                const isDeleted = deletedRows.has(rowIdx);
+                return (
+                  <tr key={rowIdx} className={isDeleted ? 'bg-red-50/60' : ''}>
+                    <td className="border-b border-r border-black/8 px-2 py-0.5 text-center text-gray-400 text-[11px]">
+                      {page * pageSize + rowIdx + 1}
+                    </td>
+                    {row.map((cell, colIdx) => {
+                      const key = `${rowIdx}:${colIdx}`;
+                      const isEdited = editedCells.has(key);
+                      const displayValue = isEdited ? editedCells.get(key) : cell;
+                      const isEditing = editingCell && !editingCell.isNew && editingCell.row === rowIdx && editingCell.col === colIdx;
+                      const isPk = primaryKeyColumns.includes(columns[colIdx]);
+
+                      return (
+                        <td
+                          key={colIdx}
+                          className={classNames(
+                            'max-w-[300px] border-b border-r border-black/8 px-0 py-0',
+                            isDeleted && 'line-through opacity-40',
+                            isEdited && !isDeleted && 'bg-amber-50',
+                          )}
+                          onDoubleClick={() => {
+                            if (!isDeleted && !isPk) onSetEditingCell({ row: rowIdx, col: colIdx, isNew: false });
+                          }}
+                        >
+                          {isEditing ? (
+                            <input
+                              autoFocus
+                              className="w-full border-0 bg-blue-50 px-2 py-0.5 text-[12px] text-black outline-none"
+                              defaultValue={displayValue ?? ''}
+                              onBlur={(e) => {
+                                const val = e.target.value;
+                                onCellChange(rowIdx, colIdx, val === '' && cell === null ? null : val, false);
+                                onSetEditingCell(null);
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') { e.currentTarget.blur(); }
+                                if (e.key === 'Escape') { onSetEditingCell(null); }
+                                if (e.key === 'Tab') {
+                                  e.preventDefault();
+                                  e.currentTarget.blur();
+                                  const nextCol = e.shiftKey ? colIdx - 1 : colIdx + 1;
+                                  if (nextCol >= 0 && nextCol < columns.length && !primaryKeyColumns.includes(columns[nextCol])) {
+                                    onSetEditingCell({ row: rowIdx, col: nextCol, isNew: false });
+                                  }
+                                }
+                              }}
+                            />
+                          ) : (
+                            <div className={classNames(
+                              'overflow-hidden text-ellipsis whitespace-nowrap px-2 py-0.5',
+                              displayValue === null ? 'italic text-gray-400' : 'text-black',
+                              !isDeleted && !isPk && 'cursor-text',
+                            )}>
+                              {displayValue === null ? 'NULL' : displayValue}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td className="border-b border-black/8 px-1 py-0.5 text-center">
+                      <button
+                        className={classNames(
+                          'text-[10px]',
+                          isDeleted ? 'text-blue-500 hover:text-blue-700' : 'text-red-400 hover:text-red-600',
+                        )}
+                        onClick={() => onToggleDeleteRow(rowIdx)}
+                        title={isDeleted ? 'Undo delete' : 'Delete row'}
+                        type="button"
+                      >
+                        {isDeleted ? 'undo' : 'del'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+              {newRows.map((newRow, nri) => (
+                <tr key={`new-${nri}`} className="bg-emerald-50/40">
+                  <td className="border-b border-r border-black/8 px-2 py-0.5 text-center text-[11px] text-emerald-500">+</td>
+                  {newRow.map((cell, colIdx) => {
+                    const isEditing = editingCell && editingCell.isNew && editingCell.row === nri && editingCell.col === colIdx;
+                    return (
+                      <td
+                        key={colIdx}
+                        className="max-w-[300px] border-b border-r border-black/8 px-0 py-0"
+                        onDoubleClick={() => onSetEditingCell({ row: nri, col: colIdx, isNew: true })}
+                      >
+                        {isEditing ? (
+                          <input
+                            autoFocus
+                            className="w-full border-0 bg-blue-50 px-2 py-0.5 text-[12px] text-black outline-none"
+                            defaultValue={cell ?? ''}
+                            onBlur={(e) => {
+                              const val = e.target.value;
+                              onCellChange(nri, colIdx, val === '' ? null : val, true);
+                              onSetEditingCell(null);
+                            }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') { e.currentTarget.blur(); }
+                              if (e.key === 'Escape') { onSetEditingCell(null); }
+                              if (e.key === 'Tab') {
+                                e.preventDefault();
+                                e.currentTarget.blur();
+                                const nextCol = e.shiftKey ? colIdx - 1 : colIdx + 1;
+                                if (nextCol >= 0 && nextCol < columns.length) {
+                                  onSetEditingCell({ row: nri, col: nextCol, isNew: true });
+                                }
+                              }
+                            }}
+                          />
+                        ) : (
+                          <div
+                            className={classNames(
+                              'overflow-hidden text-ellipsis whitespace-nowrap px-2 py-0.5 cursor-text',
+                              cell === null ? 'italic text-gray-400' : 'text-black',
+                            )}
+                          >
+                            {cell === null ? 'NULL' : cell}
+                          </div>
+                        )}
+                      </td>
+                    );
+                  })}
+                  <td className="border-b border-black/8 px-1 py-0.5 text-center">
+                    <button
+                      className="text-[10px] text-red-400 hover:text-red-600"
+                      onClick={() => onRemoveNewRow(nri)}
+                      title="Remove new row"
+                      type="button"
+                    >
+                      del
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div className="flex shrink-0 items-center justify-center gap-2 border-t border-black/5 bg-white/30 px-3 py-1.5 text-[14px] text-gray-600">
+        <button className="px-1 py-0.5 text-[16px] font-extrabold hover:text-black disabled:opacity-30" disabled={page === 0} onClick={() => onPageChange(0)} type="button">{'<<'}</button>
+        <button className="px-1 py-0.5 text-[16px] font-extrabold hover:text-black disabled:opacity-30" disabled={page === 0} onClick={() => onPageChange(page - 1)} type="button">{'<'}</button>
+        <span>{rows.length > 0 ? `${(page * pageSize + 1).toLocaleString()}-${(page * pageSize + rows.length).toLocaleString()}` : '0'} of {totalCount.toLocaleString()}</span>
+        <button className="px-1 py-0.5 text-[16px] font-extrabold hover:text-black disabled:opacity-30" disabled={page >= totalPages - 1} onClick={() => onPageChange(page + 1)} type="button">{'>'}</button>
+        <button className="px-1 py-0.5 text-[16px] font-extrabold hover:text-black disabled:opacity-30" disabled={page >= totalPages - 1} onClick={() => onPageChange(totalPages - 1)} type="button">{'>>'}</button>
+      </div>
+    </>
+  );
+}
 
 function summarizeSql(sql: string) {
   const line = sql.trim().replace(/\s+/g, ' ').slice(0, 56);

@@ -10,7 +10,7 @@ export default defineConfig({
       fileName: () => 'index.js',
     },
     rollupOptions: {
-      external: ['electron', 'pg', 'node:crypto', 'node:fs', 'node:path'],
+      external: ['electron', 'pg', 'node:crypto', 'node:fs', 'node:path', 'node:child_process', 'node:util'],
     },
     emptyOutDir: true,
     minify: false,

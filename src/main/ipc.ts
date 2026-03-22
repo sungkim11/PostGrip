@@ -121,9 +121,69 @@ export function registerIpcHandlers(): void {
     return { ddl };
   });
 
-  ipcMain.handle('export-parquet', async (_event, schema: string, table: string, path: string) => {
+  ipcMain.handle('drop-table', async (_event, schema: string, table: string, cascade: boolean) => {
     if (!appState.activeConnection) throw new Error('No active database connection');
-    return postgres.exportParquet(appState.activeConnection, schema, table, path);
+    await postgres.dropTable(appState.activeConnection, schema, table, cascade);
+    return snapshotWithTree();
+  });
+
+  ipcMain.handle('truncate-table', async (_event, schema: string, table: string, cascade: boolean) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    await postgres.truncateTable(appState.activeConnection, schema, table, cascade);
+    return snapshotWithTree();
+  });
+
+  ipcMain.handle('get-editable-table-data', async (_event, schema: string, table: string, limit: number, offset: number) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    return postgres.getEditableTableData(appState.activeConnection, schema, table, limit, offset);
+  });
+
+  ipcMain.handle('execute-dml', async (_event, schema: string, table: string, operations: postgres.DmlOperation[]) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    await postgres.executeDml(appState.activeConnection, schema, table, operations);
+  });
+
+  ipcMain.handle('get-modify-table-info', async (_event, schema: string, table: string) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    return postgres.getModifyTableInfo(appState.activeConnection, schema, table);
+  });
+
+  ipcMain.handle('alter-table', async (_event, schema: string, table: string, actions: postgres.AlterTableAction[]) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    await postgres.alterTable(appState.activeConnection, schema, table, actions);
+    return snapshotWithTree();
+  });
+
+  ipcMain.handle('export-table-csv', async (_event, schema: string, table: string, path: string) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    return postgres.exportTableCsv(appState.activeConnection, schema, table, path);
+  });
+
+  ipcMain.handle('export-pg-dump', async (_event, schema: string, table: string, filePath: string, format: string) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    const conn = appState.activeConnection;
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    const args = [
+      '-h', conn.host,
+      '-p', String(conn.port),
+      '-U', conn.user,
+      '-d', conn.database,
+      '-t', `"${schema.replace(/"/g, '""')}"."${table.replace(/"/g, '""')}"`,
+      '-f', filePath,
+    ];
+    if (format === 'sql') {
+      args.push('--no-owner', '--no-acl');
+    } else if (format === 'custom') {
+      args.push('-Fc');
+    } else if (format === 'tar') {
+      args.push('-Ft');
+    }
+
+    const env = { ...process.env, PGPASSWORD: conn.password };
+    await execFileAsync('pg_dump', args, { env, timeout: 120000 });
   });
 
   ipcMain.handle('show-save-dialog', async (_event, options: Electron.SaveDialogOptions) => {

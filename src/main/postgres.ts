@@ -6,6 +6,34 @@ function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+/** Convert a JS array to PostgreSQL array literal format: {a,b,"c with spaces"} */
+function toPgArrayLiteral(arr: unknown[]): string {
+  const elements = arr.map((el) => {
+    if (el == null) return 'NULL';
+    if (Array.isArray(el)) return toPgArrayLiteral(el);
+    const s = String(el);
+    // Quote if contains special chars, is empty, or looks like NULL
+    if (s === '' || /[{},"\\\s]/.test(s) || s.toUpperCase() === 'NULL') {
+      return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    }
+    return s;
+  });
+  return `{${elements.join(',')}}`;
+}
+
+/** Serialize a PostgreSQL value to a lossless string representation. */
+function serializeValue(val: unknown): string {
+  if (val == null) return 'NULL';
+  if (Array.isArray(val)) {
+    return toPgArrayLiteral(val);
+  }
+  if (typeof val === 'object') {
+    // json, jsonb, composite types — use JSON.stringify for lossless round-trip
+    return JSON.stringify(val);
+  }
+  return String(val);
+}
+
 async function connect(conn: SavedConnection): Promise<pg.Client> {
   const client = new pg.Client({
     host: conn.host,
@@ -372,6 +400,255 @@ export async function runQuery(
   }
 }
 
+export async function dropTable(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+  cascade: boolean,
+): Promise<void> {
+  const client = await connect(conn);
+  try {
+    const sql = `DROP TABLE ${quoteIdentifier(schema)}.${quoteIdentifier(table)}${cascade ? ' CASCADE' : ''}`;
+    await client.query(sql);
+  } finally {
+    await client.end();
+  }
+}
+
+export async function truncateTable(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+  cascade: boolean,
+): Promise<void> {
+  const client = await connect(conn);
+  try {
+    const sql = `TRUNCATE TABLE ${quoteIdentifier(schema)}.${quoteIdentifier(table)}${cascade ? ' CASCADE' : ''}`;
+    await client.query(sql);
+  } finally {
+    await client.end();
+  }
+}
+
+export async function getPrimaryKeyColumns(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+): Promise<string[]> {
+  const client = await connect(conn);
+  try {
+    const result = await client.query(
+      `SELECT a.attname
+       FROM pg_index i
+       JOIN pg_attribute a ON a.attrelid = i.indrelid
+       JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS x(attnum, n)
+         ON a.attnum = x.attnum
+       JOIN pg_class c ON c.oid = i.indrelid
+       JOIN pg_namespace ns ON ns.oid = c.relnamespace
+       WHERE ns.nspname = $1 AND c.relname = $2 AND i.indisprimary
+       ORDER BY x.n`,
+      [schema, table],
+    );
+    return result.rows.map((r: Record<string, unknown>) => r.attname as string);
+  } finally {
+    await client.end();
+  }
+}
+
+export async function getEditableTableData(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+  limit: number,
+  offset: number,
+): Promise<{ columns: string[]; columnTypes: string[]; rows: (string | null)[][]; primaryKeyColumns: string[]; totalCount: number }> {
+  const client = await connect(conn);
+  try {
+    const pkCols = await getPrimaryKeyColumns(conn, schema, table);
+    const qt = `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
+
+    const countRes = await client.query(`SELECT count(*)::int AS cnt FROM ${qt}`);
+    const totalCount: number = countRes.rows[0].cnt;
+
+    const dataRes = await client.query(`SELECT * FROM ${qt} LIMIT ${limit} OFFSET ${offset}`);
+    const columns = dataRes.fields?.map((f) => f.name) ?? [];
+    const columnTypes: string[] = [];
+
+    // Fetch column types
+    const typeRes = await client.query(
+      `SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS data_type
+       FROM pg_attribute a
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped
+       ORDER BY a.attnum`,
+      [schema, table],
+    );
+    const typeMap = new Map<string, string>();
+    for (const r of typeRes.rows) {
+      typeMap.set(r.attname as string, r.data_type as string);
+    }
+    for (const col of columns) {
+      columnTypes.push(typeMap.get(col) ?? 'text');
+    }
+
+    const rows: (string | null)[][] = (dataRes.rows ?? []).map((row: Record<string, unknown>) =>
+      columns.map((col) => {
+        const val = row[col];
+        return val == null ? null : serializeValue(val);
+      }),
+    );
+
+    return { columns, columnTypes, rows, primaryKeyColumns: pkCols, totalCount };
+  } finally {
+    await client.end();
+  }
+}
+
+export interface DmlOperation {
+  type: 'update' | 'insert' | 'delete';
+  // For update/delete: original row values keyed by PK column names
+  pkValues?: Record<string, string | null>;
+  // For update: changed column values
+  changes?: Record<string, string | null>;
+  // For insert: all column values
+  values?: Record<string, string | null>;
+  // Column type map for proper casting (col -> pg type)
+  columnTypes?: Record<string, string>;
+}
+
+const JSON_TYPES = new Set(['json', 'jsonb']);
+const ARRAY_TYPE_RE = /\[\]$|^ARRAY/i;
+
+function isArrayType(pgType: string): boolean {
+  return ARRAY_TYPE_RE.test(pgType);
+}
+
+function needsCast(pgType: string): string | null {
+  if (JSON_TYPES.has(pgType.toLowerCase())) return pgType;
+  if (isArrayType(pgType)) return pgType;
+  return null;
+}
+
+/**
+ * Normalize an array value string for PostgreSQL.
+ * If user entered JSON array syntax like ["a","b"], convert to PG literal {a,b}.
+ * If already in PG literal format {a,b}, pass through.
+ */
+function normalizeArrayParam(val: string): string {
+  const trimmed = val.trim();
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return toPgArrayLiteral(parsed);
+      }
+    } catch {
+      // Not valid JSON, pass through
+    }
+  }
+  return val;
+}
+
+/** Prepare a DML parameter value, converting array syntax if needed. */
+function prepareDmlParam(val: string | null, pgType: string | undefined): string | null {
+  if (val === null || !pgType) return val;
+  if (isArrayType(pgType)) return normalizeArrayParam(val);
+  return val;
+}
+
+export async function executeDml(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+  operations: DmlOperation[],
+): Promise<void> {
+  const client = await connect(conn);
+  try {
+    const qt = `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
+
+    await client.query('BEGIN');
+    try {
+      for (const op of operations) {
+        switch (op.type) {
+          case 'update': {
+            const sets: string[] = [];
+            const params: (string | null)[] = [];
+            let paramIdx = 1;
+
+            for (const [col, val] of Object.entries(op.changes!)) {
+              const colType = op.columnTypes?.[col] ?? '';
+              const cast = needsCast(colType);
+              sets.push(`${quoteIdentifier(col)} = $${paramIdx}${cast ? `::${cast}` : ''}`);
+              params.push(prepareDmlParam(val, colType));
+              paramIdx++;
+            }
+
+            const wheres: string[] = [];
+            for (const [col, val] of Object.entries(op.pkValues!)) {
+              if (val === null) {
+                wheres.push(`${quoteIdentifier(col)} IS NULL`);
+              } else {
+                wheres.push(`${quoteIdentifier(col)} = $${paramIdx}`);
+                params.push(val);
+                paramIdx++;
+              }
+            }
+
+            const sql = `UPDATE ${qt} SET ${sets.join(', ')} WHERE ${wheres.join(' AND ')}`;
+            await client.query(sql, params);
+            break;
+          }
+          case 'insert': {
+            const cols: string[] = [];
+            const placeholders: string[] = [];
+            const params: (string | null)[] = [];
+            let paramIdx = 1;
+
+            for (const [col, val] of Object.entries(op.values!)) {
+              const colType = op.columnTypes?.[col] ?? '';
+              const cast = needsCast(colType);
+              cols.push(quoteIdentifier(col));
+              placeholders.push(`$${paramIdx}${cast ? `::${cast}` : ''}`);
+              params.push(prepareDmlParam(val, colType));
+              paramIdx++;
+            }
+
+            const sql = `INSERT INTO ${qt} (${cols.join(', ')}) VALUES (${placeholders.join(', ')})`;
+            await client.query(sql, params);
+            break;
+          }
+          case 'delete': {
+            const wheres: string[] = [];
+            const params: (string | null)[] = [];
+            let paramIdx = 1;
+
+            for (const [col, val] of Object.entries(op.pkValues!)) {
+              if (val === null) {
+                wheres.push(`${quoteIdentifier(col)} IS NULL`);
+              } else {
+                wheres.push(`${quoteIdentifier(col)} = $${paramIdx}`);
+                params.push(val);
+                paramIdx++;
+              }
+            }
+
+            const sql = `DELETE FROM ${qt} WHERE ${wheres.join(' AND ')}`;
+            await client.query(sql, params);
+            break;
+          }
+        }
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  } finally {
+    await client.end();
+  }
+}
+
 export async function previewTable(
   conn: SavedConnection,
   schema: string,
@@ -477,7 +754,134 @@ export async function getTableDdl(
   }
 }
 
-export async function exportParquet(
+export interface ModifyTableColumn {
+  name: string;
+  dataType: string;
+  nullable: boolean;
+  defaultValue: string | null;
+}
+
+export interface ModifyTableInfo {
+  schema: string;
+  table: string;
+  columns: ModifyTableColumn[];
+}
+
+export async function getModifyTableInfo(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+): Promise<ModifyTableInfo> {
+  const client = await connect(conn);
+  try {
+    const result = await client.query(
+      `SELECT a.attname AS name,
+              format_type(a.atttypid, a.atttypmod) AS data_type,
+              NOT a.attnotnull AS nullable,
+              pg_get_expr(d.adbin, d.adrelid) AS default_value
+       FROM pg_attribute a
+       JOIN pg_class c ON c.oid = a.attrelid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+       WHERE n.nspname = $1 AND c.relname = $2
+         AND a.attnum > 0 AND NOT a.attisdropped
+       ORDER BY a.attnum`,
+      [schema, table],
+    );
+    return {
+      schema,
+      table,
+      columns: result.rows.map((r: Record<string, unknown>) => ({
+        name: r.name as string,
+        dataType: r.data_type as string,
+        nullable: r.nullable as boolean,
+        defaultValue: r.default_value as string | null,
+      })),
+    };
+  } finally {
+    await client.end();
+  }
+}
+
+export interface AlterTableAction {
+  type: 'add_column' | 'drop_column' | 'rename_column' | 'alter_type' | 'set_not_null' | 'drop_not_null' | 'set_default' | 'drop_default' | 'rename_table';
+  columnName?: string;
+  newColumnName?: string;
+  dataType?: string;
+  nullable?: boolean;
+  defaultValue?: string | null;
+  newTableName?: string;
+}
+
+export async function alterTable(
+  conn: SavedConnection,
+  schema: string,
+  table: string,
+  actions: AlterTableAction[],
+): Promise<void> {
+  const client = await connect(conn);
+  try {
+    // Partition: schema changes first (against original name), rename last
+    const schemaActions = actions.filter((a) => a.type !== 'rename_table');
+    const renameAction = actions.find((a) => a.type === 'rename_table');
+
+    const sqls: string[] = [];
+    const qualifiedTable = `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
+
+    for (const action of schemaActions) {
+      switch (action.type) {
+        case 'add_column': {
+          let sql = `ALTER TABLE ${qualifiedTable} ADD COLUMN ${quoteIdentifier(action.columnName!)} ${action.dataType!}`;
+          if (!action.nullable) sql += ' NOT NULL';
+          if (action.defaultValue) sql += ` DEFAULT ${action.defaultValue}`;
+          sqls.push(sql);
+          break;
+        }
+        case 'drop_column':
+          sqls.push(`ALTER TABLE ${qualifiedTable} DROP COLUMN ${quoteIdentifier(action.columnName!)}`);
+          break;
+        case 'rename_column':
+          sqls.push(`ALTER TABLE ${qualifiedTable} RENAME COLUMN ${quoteIdentifier(action.columnName!)} TO ${quoteIdentifier(action.newColumnName!)}`);
+          break;
+        case 'alter_type':
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} TYPE ${action.dataType!}`);
+          break;
+        case 'set_not_null':
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} SET NOT NULL`);
+          break;
+        case 'drop_not_null':
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} DROP NOT NULL`);
+          break;
+        case 'set_default':
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} SET DEFAULT ${action.defaultValue!}`);
+          break;
+        case 'drop_default':
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} DROP DEFAULT`);
+          break;
+      }
+    }
+
+    // Rename must be last so all prior ALTER statements reference the original name
+    if (renameAction) {
+      sqls.push(`ALTER TABLE ${qualifiedTable} RENAME TO ${quoteIdentifier(renameAction.newTableName!)}`);
+    }
+
+    await client.query('BEGIN');
+    try {
+      for (const sql of sqls) {
+        await client.query(sql);
+      }
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    }
+  } finally {
+    await client.end();
+  }
+}
+
+export async function exportTableCsv(
   conn: SavedConnection,
   schema: string,
   table: string,
@@ -485,17 +889,16 @@ export async function exportParquet(
 ): Promise<number> {
   const client = await connect(conn);
   try {
-    const sql = `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
-    const result = await client.query(sql);
+    const sqlText = `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
+    const result = await client.query(sqlText);
     const columns = result.fields?.map((f) => f.name) ?? [];
     const rows: string[][] = (result.rows ?? []).map((row: Record<string, unknown>) =>
       columns.map((col) => {
         const val = row[col];
-        return val == null ? '' : String(val);
+        return val == null ? '' : serializeValue(val);
       }),
     );
 
-    // Write as CSV (Parquet export requires arrow/parquet libs — use CSV as portable fallback)
     const fs = await import('node:fs');
     const header = columns.map((c) => `"${c.replace(/"/g, '""')}"`).join(',');
     const csvRows = rows.map((r) =>
