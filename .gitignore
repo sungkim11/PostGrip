@@ -4,5 +4,3 @@ out/
 dist/
 release/
 .env
-connections.json
-**/connections.json
