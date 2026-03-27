@@ -1,11 +1,15 @@
 import type { PropsWithChildren, ReactNode } from 'react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api';
 import { SqlEditor } from './SqlEditor';
 import type {
   ActiveConnectionSummary,
   AlterTableAction,
+  AppInfo,
   AppSnapshot,
+  BackupEntry,
+  BackupOptions,
+  BackupSchedule,
   ConnectionInput,
   DdlResult,
   DmlOperation,
@@ -70,7 +74,7 @@ interface QueryHistoryEntry {
   resultMeta: string;
 }
 
-type TopMenu = 'file' | 'view' | null;
+type TopMenu = 'file' | 'help' | null;
 
 type EditDataState = {
   tableData: EditableTableData;
@@ -184,6 +188,18 @@ export function AppShell() {
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'fail'>('idle');
   const [connectionTab, setConnectionTab] = useState<'general' | 'ssh'>('general');
   const [testError, setTestError] = useState('');
+  const [showBackupPanel, setShowBackupPanel] = useState(false);
+  const [showBackupModal, setShowBackupModal] = useState(false);
+  const [runningBackup, setRunningBackup] = useState<{ name: string; startTime: number } | null>(null);
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [editingSchedule, setEditingSchedule] = useState<BackupSchedule | null>(null);
+  const [backupSchedules, setBackupSchedules] = useState<BackupSchedule[]>([]);
+  const [backupEntries, setBackupEntries] = useState<BackupEntry[]>([]);
+  const [backupDir, setBackupDir] = useState('');
+  const [showHelpViewer, setShowHelpViewer] = useState(false);
+  const [helpContent, setHelpContent] = useState('');
+  const [showAboutDialog, setShowAboutDialog] = useState(false);
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
   const [hostStats, setHostStats] = useState<HostStats | null>(null);
   const MAX_HISTORY = 30;
   const [cpuHistory, setCpuHistory] = useState<number[]>([]);
@@ -491,6 +507,173 @@ export function AppShell() {
 
   async function handleExit() {
     await api.closeWindow();
+  }
+
+  async function changeBackupDir() {
+    const newDir = await api.showOpenDialog({
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (!newDir) return;
+    setBackupDir(newDir);
+    await api.setBackupDir(newDir);
+    try {
+      const entries = await api.listBackups(newDir);
+      setBackupEntries(entries);
+    } catch { /* ignore */ }
+  }
+
+  function mergeBackupEntries(current: BackupEntry[], diskEntries: BackupEntry[]): BackupEntry[] {
+    // Keep in-progress and failed entries, merge with disk entries
+    const statusEntries = current.filter((e) => e.status === 'in_progress' || e.status === 'failed');
+    const statusPaths = new Set(statusEntries.map((e) => e.path));
+    const merged = [...statusEntries, ...diskEntries.filter((e) => !statusPaths.has(e.path))];
+    return merged;
+  }
+
+  async function openBackupPanel() {
+    if (showBackupPanel) { setShowBackupPanel(false); return; }
+    setShowBackupPanel(true);
+    try {
+      const dir = await api.getBackupDir();
+      setBackupDir(dir);
+      const [diskEntries, schedules] = await Promise.all([
+        api.listBackups(dir),
+        api.listBackupSchedules(),
+      ]);
+      setBackupEntries((prev) => mergeBackupEntries(prev, diskEntries));
+      setBackupSchedules(schedules);
+    } catch { /* ignore */ }
+  }
+
+  async function refreshBackups() {
+    if (!backupDir) return;
+    try {
+      const diskEntries = await api.listBackups(backupDir);
+      setBackupEntries((prev) => mergeBackupEntries(prev, diskEntries));
+    } catch { /* ignore */ }
+  }
+
+  function handleBackup() {
+    if (!snapshot?.activeConnection) { setError('No active database connection'); return; }
+    setShowBackupModal(true);
+  }
+
+  async function executeBackup(options: BackupOptions) {
+    setShowBackupModal(false);
+    const fileName = options.filePath.split('/').pop() ?? 'backup';
+    const inProgressEntry: BackupEntry = {
+      name: fileName,
+      path: options.filePath,
+      size: 0,
+      modified: new Date().toISOString(),
+      status: 'in_progress',
+      meta: {
+        database: snapshot?.activeConnection?.database ?? '',
+        host: snapshot?.activeConnection?.host ?? '',
+        port: snapshot?.activeConnection?.port ?? 5432,
+        user: snapshot?.activeConnection?.user ?? '',
+        format: options.format,
+        schemas: options.schemas ?? [],
+        tables: options.tables ?? [],
+        scope: (options.schemas?.length || options.tables?.length) ? 'selected' : 'full',
+        dataOnly: !!options.dataOnly,
+        schemaOnly: !!options.schemaOnly,
+        noOwner: !!options.noOwner,
+        noPrivileges: !!options.noPrivileges,
+        clean: !!options.clean,
+        createDb: !!options.createDb,
+        ifExists: !!options.ifExists,
+        compress: options.compress ?? 0,
+        createdAt: new Date().toISOString(),
+        durationMs: 0,
+      },
+    };
+    setRunningBackup({ name: fileName, startTime: Date.now() });
+    setBackupEntries((prev) => [inProgressEntry, ...prev]);
+    try {
+      const result = await api.backupDatabase(options);
+      setRunningBackup(null);
+      setBackupEntries((prev) => prev.map((e) =>
+        e.path === options.filePath && e.status === 'in_progress'
+          ? { ...e, status: 'completed' as const, durationMs: result.durationMs }
+          : e
+      ));
+      void refreshBackups();
+    } catch (err) {
+      setRunningBackup(null);
+      setBackupEntries((prev) => prev.map((e) =>
+        e.path === options.filePath && e.status === 'in_progress'
+          ? { ...e, status: 'failed' as const, error: errorMessage(err) }
+          : e
+      ));
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleDeleteBackup(filePath: string) {
+    try {
+      await api.deleteBackup(filePath);
+      void refreshBackups();
+    } catch (err) {
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleRestore(filePath: string) {
+    if (!snapshot?.activeConnection) { setError('No active database connection'); return; }
+    try {
+      setLoading('Restoring database...');
+      await api.restoreDatabase(filePath);
+      setLoading('Restore complete.');
+      setTimeout(() => setLoading(''), 2000);
+      setSnapshot(await api.bootstrap());
+    } catch (err) {
+      setLoading('');
+      setError(errorMessage(err));
+    }
+  }
+
+  async function handleAddSchedule(schedule: Omit<BackupSchedule, 'id' | 'createdAt'>) {
+    setShowScheduleModal(false);
+    setEditingSchedule(null);
+    try {
+      await api.addBackupSchedule(schedule);
+      setBackupSchedules(await api.listBackupSchedules());
+    } catch (err) { setError(errorMessage(err)); }
+  }
+
+  async function handleUpdateSchedule(id: string, updates: Partial<BackupSchedule>) {
+    setShowScheduleModal(false);
+    setEditingSchedule(null);
+    try {
+      await api.updateBackupSchedule(id, updates);
+      setBackupSchedules(await api.listBackupSchedules());
+    } catch (err) { setError(errorMessage(err)); }
+  }
+
+  async function handleDeleteSchedule(id: string) {
+    try {
+      await api.deleteBackupSchedule(id);
+      setBackupSchedules(await api.listBackupSchedules());
+    } catch (err) { setError(errorMessage(err)); }
+  }
+
+  async function openHelpViewer() {
+    setOpenMenu(null);
+    try {
+      const content = await api.readHelp();
+      setHelpContent(content);
+      setShowHelpViewer(true);
+    } catch { /* ignore */ }
+  }
+
+  async function openAboutDialog() {
+    setOpenMenu(null);
+    try {
+      const info = await api.getAppInfo();
+      setAppInfo(info);
+      setShowAboutDialog(true);
+    } catch { /* ignore */ }
   }
 
   function openNewQueryTab(sql = QUERY_PRESETS[0].sql, title = 'sql-query.sql') {
@@ -1314,16 +1497,22 @@ export function AppShell() {
   return (
     <main className="h-screen bg-transparent text-[13px] text-black" onClick={() => { if (openMenu) setOpenMenu(null); setContextMenu(null); setConnectionContextMenu(null); }}>
       <div className="flex h-screen flex-col overflow-hidden">
-        <header className="glass-panel relative m-1.5 mb-0 shrink-0 overflow-hidden rounded-lg">
+        <header className="glass-panel relative m-1.5 mb-0 shrink-0 overflow-visible rounded-lg">
           <div className="flex h-7 items-center justify-between px-3">
             <div className="flex min-w-0 items-center gap-4" onClick={(event) => event.stopPropagation()}>
               <div className="rounded-md bg-[var(--accent)] px-2 py-[3px] text-[10px] font-bold uppercase tracking-[0.14em] text-white">
                 PostGrip
               </div>
               <div className="flex items-center gap-1 text-[12px] text-black/60">
-                <MenuButton active={openMenu === 'file'} label="File" onClick={() => setOpenMenu((current) => (current === 'file' ? null : 'file'))} />
+                <DropdownMenu label="File" active={openMenu === 'file'} onToggle={() => setOpenMenu((c) => c === 'file' ? null : 'file')}>
+                  <MenuItem label="Exit" onClick={() => void handleExit()} />
+                </DropdownMenu>
                 <MenuButton active={false} label="SQL Editor" onClick={() => { openSqlEditor(); setOpenMenu(null); }} />
-                <MenuButton active={openMenu === 'view'} label="View" onClick={() => setOpenMenu((current) => (current === 'view' ? null : 'view'))} />
+                <MenuButton active={showBackupPanel} label="Backup & Restore" onClick={() => { void openBackupPanel(); setOpenMenu(null); }} />
+                <DropdownMenu label="Help" active={openMenu === 'help'} onToggle={() => setOpenMenu((c) => c === 'help' ? null : 'help')}>
+                  <MenuItem label="Help" onClick={() => void openHelpViewer()} />
+                  <MenuItem label="About PostGrip" onClick={() => void openAboutDialog()} />
+                </DropdownMenu>
               </div>
             </div>
 
@@ -1339,22 +1528,6 @@ export function AppShell() {
             <ToolbarIconButton onClick={() => void refresh()} title="Refresh"><RefreshIcon /></ToolbarIconButton>
             <ToolbarIconButton onClick={() => { exportCurrentResult(); }} title="Export CSV"><ExportIcon /></ToolbarIconButton>
           </div>
-
-          {openMenu ? (
-            <div className="context-menu absolute left-16 top-7 z-10 min-w-[220px] rounded-xl" onClick={(event) => event.stopPropagation()}>
-              {openMenu === 'file' ? (
-                <MenuPanel>
-                  <MenuItem label="Exit" onClick={() => void handleExit()} />
-                </MenuPanel>
-              ) : null}
-              {openMenu === 'view' ? (
-                <MenuPanel>
-                  <MenuItem label="Clear Results" onClick={() => { clearResultView(); setOpenMenu(null); }} />
-                  <MenuItem label="Export CSV" onClick={() => { exportCurrentResult(); setOpenMenu(null); }} />
-                </MenuPanel>
-              ) : null}
-            </div>
-          ) : null}
         </header>
 
         <div className="flex flex-1 gap-1.5 overflow-hidden px-1.5 pb-0 pt-1.5">
@@ -1597,6 +1770,87 @@ export function AppShell() {
               </div>
             ) : null}
 
+            {showBackupPanel ? (
+              <div className="glass-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl">
+                <div className="flex h-7 items-center justify-between border-b border-black/5 px-3">
+                  <div className="text-[13px] font-medium text-black">Backup & Restore</div>
+                  <button className="px-1 py-0.5 text-[12px] leading-tight text-gray-500 hover:text-black" onClick={() => setShowBackupPanel(false)} type="button">Close</button>
+                </div>
+                <div className="flex min-h-0 flex-1 flex-col rounded-b-xl bg-white">
+                  <div className="flex items-center gap-3 border-b border-black/5 px-3 py-2">
+                    <span className="text-[12px] font-medium text-black">Backup:</span>
+                    <button className="rounded-lg border border-[var(--accent)] bg-[var(--accent)] px-3 py-1 text-[12px] text-white hover:opacity-90 disabled:opacity-50" disabled={!!runningBackup} onClick={() => void handleBackup()} type="button">Backup Now</button>
+                    <button className="rounded-lg border border-[var(--accent)] px-3 py-1 text-[12px] text-[var(--accent)] hover:bg-[var(--accent)]/10" onClick={() => { setEditingSchedule(null); setShowScheduleModal(true); }} type="button">Schedule Backup</button>
+                    {runningBackup ? (
+                      <div className="ml-2 flex items-center gap-2">
+                        <div className="h-1.5 w-32 overflow-hidden rounded-full bg-black/5">
+                          <div className="backup-progress h-full rounded-full bg-[var(--accent)]" />
+                        </div>
+                        <span className="text-[11px] text-[var(--accent)]">Backing up {runningBackup.name}...</span>
+                      </div>
+                    ) : null}
+                    <div className="ml-auto flex items-center gap-1.5">
+                      <span className="text-[11px] text-gray-400 truncate max-w-[250px]" title={backupDir}>{backupDir}</span>
+                      <button className="rounded border border-black/10 px-2 py-0.5 text-[11px] text-gray-500 hover:border-[var(--accent)] hover:text-[var(--accent)]" onClick={() => void changeBackupDir()} type="button">Change</button>
+                    </div>
+                  </div>
+                  <div className="flex-1 overflow-y-auto">
+                    {backupSchedules.length > 0 ? (
+                      <div className="border-b border-black/5">
+                        <div className="flex items-center gap-2 bg-gray-50 px-3 py-1.5">
+                          <span className="text-[11px] font-medium uppercase tracking-wider text-black/40">Backup Schedules</span>
+                          <span className="text-[11px] text-gray-400">{backupSchedules.length}</span>
+                        </div>
+                        <table className="min-w-full border-collapse text-[12px]">
+                          <thead className="bg-gray-50/50 text-left">
+                            <tr>
+                              <th className="border-b border-black/8 px-3 py-1 font-medium text-black">Runs On</th>
+                              <th className="border-b border-black/8 px-3 py-1 font-medium text-black">Start Time</th>
+                              <th className="border-b border-black/8 px-3 py-1 font-medium text-black">Backup Details</th>
+                              <th className="border-b border-black/8 px-3 py-1 font-medium text-black">Last Run</th>
+                              <th className="border-b border-black/8 px-3 py-1 font-medium text-black">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {backupSchedules.map((schedule) => {
+                              const dayAbbr: Record<string, string> = { sunday: 'Sun', monday: 'Mon', tuesday: 'Tue', wednesday: 'Wed', thursday: 'Thu', friday: 'Fri', saturday: 'Sat' };
+                              const days = (schedule.days ?? []).map((d) => dayAbbr[d] ?? d).join(', ');
+                              const scope = schedule.scope === 'full' ? 'Full DB' : `${(schedule.tables?.length ?? 0) || (schedule.schemas?.length ?? 0)} objects`;
+                              const content = schedule.dataOnly ? 'Data' : schedule.schemaOnly ? 'Schema' : 'Schema+Data';
+                              return (
+                                <tr key={schedule.id} className="border-b border-black/5 hover:bg-gray-50">
+                                  <td className="px-3 py-1.5 text-black">{days || 'None'}</td>
+                                  <td className="px-3 py-1.5 text-black">{schedule.time}</td>
+                                  <td className="px-3 py-1.5 text-gray-500">{scope} / {content} / {schedule.format}</td>
+                                  <td className="px-3 py-1.5 text-gray-400">{schedule.lastRun ? new Date(schedule.lastRun).toLocaleString() : 'Never'}</td>
+                                  <td className="px-3 py-1.5">
+                                    <div className="flex items-center gap-2">
+                                      <button className="rounded border border-[var(--accent)] px-2 py-0.5 text-[11px] text-[var(--accent)] hover:bg-[var(--accent)]/10" onClick={() => { setEditingSchedule(schedule); setShowScheduleModal(true); }} type="button">Modify</button>
+                                      <button className="rounded border border-red-400 px-2 py-0.5 text-[11px] text-red-500 hover:bg-red-50" onClick={() => void handleDeleteSchedule(schedule.id)} type="button">Delete</button>
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null}
+                    <div className="flex items-center gap-2 bg-gray-50 px-3 py-1.5">
+                      <span className="text-[11px] font-medium uppercase tracking-wider text-black/40">Backup History</span>
+                      <span className="text-[11px] text-gray-400">{backupEntries.length}</span>
+                    </div>
+                    {backupEntries.length > 0 ? (
+                      <BackupTable entries={backupEntries} onDelete={handleDeleteBackup} onRestore={handleRestore} />
+                    ) : (
+                      <div className="flex items-center justify-center py-6 text-[12px] text-gray-400">No backups yet. Click "Backup Now" to create one.</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {!showBackupPanel ? (
             <div className="glass-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl">
               <div className="flex h-7 items-center justify-between border-b border-black/5 px-3">
                 <div className="text-[13px] font-medium text-black">
@@ -1683,6 +1937,7 @@ export function AppShell() {
                 )}
               </div>
             </div>
+            ) : null}
           </div>
         </div>
 
@@ -2294,7 +2549,660 @@ export function AppShell() {
           </div>
         </div>
       ) : null}
+
+      {showScheduleModal ? (
+        <ScheduleBackupModal
+          tree={databaseTree}
+          database={snapshot?.activeConnection?.database ?? ''}
+          backupDir={backupDir}
+          existing={editingSchedule}
+          onClose={() => { setShowScheduleModal(false); setEditingSchedule(null); }}
+          onSave={(schedule) => editingSchedule ? void handleUpdateSchedule(editingSchedule.id, schedule) : void handleAddSchedule(schedule)}
+        />
+      ) : null}
+
+      {showBackupModal ? (
+        <BackupModal
+          tree={databaseTree}
+          database={snapshot?.activeConnection?.database ?? ''}
+          backupDir={backupDir}
+          onClose={() => setShowBackupModal(false)}
+          onExecute={executeBackup}
+        />
+      ) : null}
+
+      {showHelpViewer ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => setShowHelpViewer(false)}>
+          <div className="glass-panel-strong flex h-[80vh] w-[700px] max-w-[90vw] flex-col overflow-hidden rounded-2xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex h-10 shrink-0 items-center justify-between border-b border-black/5 px-4">
+              <span className="text-[14px] font-medium text-black">Help</span>
+              <button className="text-[18px] text-gray-400 hover:text-black" onClick={() => setShowHelpViewer(false)} type="button">&times;</button>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              <MarkdownViewer content={helpContent} />
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {showAboutDialog ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={() => setShowAboutDialog(false)}>
+          <div className="glass-panel-strong w-[360px] rounded-2xl p-6 shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-4 flex items-center gap-3">
+              <div className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-[14px] font-bold uppercase tracking-wider text-white">
+                PostGrip
+              </div>
+            </div>
+            {appInfo ? (
+              <div className="space-y-2 text-[13px]">
+                <div className="flex justify-between"><span className="text-gray-500">Version</span><span className="font-medium text-black">{appInfo.version}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Electron</span><span className="text-black">{appInfo.electronVersion}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Node.js</span><span className="text-black">{appInfo.nodeVersion}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Chromium</span><span className="text-black">{appInfo.chromiumVersion}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Platform</span><span className="text-black">{appInfo.platform}</span></div>
+                <div className="border-t border-black/5 pt-2 text-[12px] text-gray-400">
+                  A lightweight, fast desktop PostgreSQL client.
+                </div>
+              </div>
+            ) : null}
+            <div className="mt-4 flex justify-end">
+              <button className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-[12px] text-white hover:opacity-90" onClick={() => setShowAboutDialog(false)} type="button">Close</button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
+  );
+}
+
+function BackupTable({ entries, onDelete, onRestore }: {
+  entries: BackupEntry[];
+  onDelete: (path: string) => void;
+  onRestore: (path: string) => void;
+}) {
+  const [expandedPaths, setExpandedPaths] = useState<Set<string>>(new Set());
+
+  function toggleExpand(p: string) {
+    setExpandedPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(p)) next.delete(p); else next.add(p);
+      return next;
+    });
+  }
+
+  const FORMAT_LABELS: Record<string, string> = { tar: 'Tar Archive', custom: 'Custom (pg_restore)', sql: 'Plain SQL', directory: 'Directory' };
+
+  return (
+    <table className="min-w-full border-collapse text-[12px]">
+      <thead className="sticky top-0 bg-gray-50 text-left">
+        <tr>
+          <th className="w-5 border-b border-black/8 px-1 py-1.5" />
+          <th className="border-b border-black/8 px-3 py-1.5 font-medium text-black">Created Date</th>
+          <th className="border-b border-black/8 px-3 py-1.5 font-medium text-black">Status</th>
+          <th className="border-b border-black/8 px-3 py-1.5 font-medium text-black">Size</th>
+          <th className="border-b border-black/8 px-3 py-1.5 font-medium text-black">Duration</th>
+          <th className="border-b border-black/8 px-3 py-1.5 font-medium text-black">Path</th>
+          <th className="border-b border-black/8 px-3 py-1.5 font-medium text-black">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.map((entry) => {
+          const expanded = expandedPaths.has(entry.path);
+          const m = entry.meta;
+          const dur = entry.durationMs ?? m?.durationMs;
+          return (
+            <Fragment key={entry.path + (entry.status ?? '')}>
+              <tr className="border-b border-black/5 hover:bg-gray-50 cursor-pointer" onClick={() => toggleExpand(entry.path)}>
+                <td className="px-1 py-1.5 text-center text-gray-400">{expanded ? '\u25BE' : '\u25B8'}</td>
+                <td className="px-3 py-1.5 text-black">{new Date(entry.modified).toLocaleString()}</td>
+                <td className="px-3 py-1.5">
+                  {entry.status === 'in_progress' ? (
+                    <span className="inline-flex items-center gap-1.5 rounded bg-blue-100 px-1.5 py-0.5 text-[11px] font-medium text-blue-700">
+                      <span className="backup-spinner inline-block h-2.5 w-2.5 rounded-full border-2 border-blue-300 border-t-blue-700" />
+                      In Progress
+                    </span>
+                  ) : entry.status === 'failed' ? (
+                    <span className="rounded bg-red-100 px-1.5 py-0.5 text-[11px] font-medium text-red-700">Failed</span>
+                  ) : (
+                    <span className="rounded bg-green-100 px-1.5 py-0.5 text-[11px] font-medium text-green-700">Successful</span>
+                  )}
+                </td>
+                <td className="px-3 py-1.5 text-gray-500">{entry.status === 'in_progress' ? '...' : entry.size < 1024 * 1024 ? `${Math.round(entry.size / 1024)} KB` : `${(entry.size / 1024 / 1024).toFixed(1)} MB`}</td>
+                <td className="px-3 py-1.5 text-gray-400">{dur != null && dur > 0 ? `${(dur / 1000).toFixed(1)}s` : entry.status === 'in_progress' ? '...' : '--'}</td>
+                <td className="max-w-[200px] truncate px-3 py-1.5 text-gray-400" title={entry.path}>{entry.path}</td>
+                <td className="px-3 py-1.5" onClick={(e) => e.stopPropagation()}>
+                  {entry.status === 'in_progress' ? (
+                    <span className="text-[11px] text-gray-400">Running...</span>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <button className="rounded border border-red-400 px-2 py-0.5 text-[11px] text-red-500 hover:bg-red-50" onClick={() => void onDelete(entry.path)} type="button">Delete</button>
+                      {entry.status !== 'failed' ? (
+                        <button className="rounded border border-[var(--accent)] bg-[var(--accent)] px-2 py-0.5 text-[11px] text-white hover:opacity-90" onClick={() => void onRestore(entry.path)} type="button">Restore</button>
+                      ) : null}
+                    </div>
+                  )}
+                </td>
+              </tr>
+              {expanded ? (
+                <tr className="border-b border-black/5 bg-gray-50/50">
+                  <td colSpan={7} className="px-6 py-3">
+                    {m ? (
+                      <div className="grid grid-cols-2 gap-x-8 gap-y-1.5 text-[12px]">
+                        <div><span className="text-gray-400">File:</span> <span className="text-black">{entry.name}</span></div>
+                        <div><span className="text-gray-400">Format:</span> <span className="text-black">{FORMAT_LABELS[m.format] ?? m.format}</span></div>
+                        <div><span className="text-gray-400">Database:</span> <span className="text-black">{m.database}</span></div>
+                        <div><span className="text-gray-400">Host:</span> <span className="text-black">{m.host}:{m.port}</span></div>
+                        <div><span className="text-gray-400">User:</span> <span className="text-black">{m.user}</span></div>
+                        <div><span className="text-gray-400">Scope:</span> <span className="text-black">{m.scope === 'full' ? 'Entire Database' : 'Selected Objects'}</span></div>
+                        <div><span className="text-gray-400">Content:</span> <span className="text-black">{m.dataOnly ? 'Data Only' : m.schemaOnly ? 'Schema Only' : 'Schema + Data'}</span></div>
+                        {m.compress > 0 ? <div><span className="text-gray-400">Compression:</span> <span className="text-black">Level {m.compress}</span></div> : null}
+                        <div className="col-span-2 mt-1">
+                          <span className="text-gray-400">Options:</span>{' '}
+                          <span className="text-black">
+                            {[
+                              m.noOwner && 'No Owner',
+                              m.noPrivileges && 'No Privileges',
+                              m.clean && 'Clean (DROP)',
+                              m.createDb && 'CREATE DATABASE',
+                              m.ifExists && 'IF EXISTS',
+                            ].filter(Boolean).join(', ') || 'None'}
+                          </span>
+                        </div>
+                        {m.schemas.length > 0 ? (
+                          <div className="col-span-2"><span className="text-gray-400">Schemas:</span> <span className="text-black">{m.schemas.join(', ')}</span></div>
+                        ) : null}
+                        {m.tables.length > 0 ? (
+                          <div className="col-span-2"><span className="text-gray-400">Tables:</span> <span className="text-black font-mono text-[11px]">{m.tables.join(', ')}</span></div>
+                        ) : null}
+                        {entry.error ? (
+                          <div className="col-span-2 mt-1"><span className="text-red-500">Error:</span> <span className="text-red-600">{entry.error}</span></div>
+                        ) : null}
+                      </div>
+                    ) : (
+                      <div className="text-[12px] text-gray-400">No metadata available for this backup.</div>
+                    )}
+                  </td>
+                </tr>
+              ) : null}
+            </Fragment>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+const ALL_DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;
+const DAY_LABELS: Record<string, string> = { sunday: 'Sun', monday: 'Mon', tuesday: 'Tue', wednesday: 'Wed', thursday: 'Thu', friday: 'Fri', saturday: 'Sat' };
+
+function ScheduleBackupModal({ tree, database, backupDir, existing, onClose, onSave }: {
+  tree: SchemaNode[];
+  database: string;
+  backupDir: string;
+  existing: BackupSchedule | null;
+  onClose: () => void;
+  onSave: (schedule: Omit<BackupSchedule, 'id' | 'createdAt'>) => void;
+}) {
+  const [days, setDays] = useState<Set<string>>(new Set(existing?.days ?? []));
+  const [time, setTime] = useState(existing?.time ?? '02:00');
+  const [format, setFormat] = useState(existing?.format ?? 'tar');
+  const [scope, setScope] = useState<'full' | 'selected'>(existing?.scope === 'selected' ? 'selected' : 'full');
+  const [selectedSchemas, setSelectedSchemas] = useState<Set<string>>(new Set(existing?.schemas ?? []));
+  const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set(existing?.tables ?? []));
+  const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set());
+  const [dataOnly, setDataOnly] = useState(existing?.dataOnly ?? false);
+  const [schemaOnly, setSchemaOnly] = useState(existing?.schemaOnly ?? false);
+  const [noOwner, setNoOwner] = useState(existing?.noOwner ?? true);
+  const [noPrivileges, setNoPrivileges] = useState(existing?.noPrivileges ?? true);
+
+  function toggleDay(day: string) {
+    setDays((prev) => { const next = new Set(prev); if (next.has(day)) next.delete(day); else next.add(day); return next; });
+  }
+
+  function toggleSchema(schemaName: string) {
+    const schema = tree.find((s) => s.name === schemaName);
+    if (!schema) return;
+    const allTables = schema.tables.map((t) => `${schemaName}.${t.name}`);
+    setSelectedSchemas((prev) => {
+      const next = new Set(prev);
+      if (next.has(schemaName)) {
+        next.delete(schemaName);
+        setSelectedTables((st) => { const n = new Set(st); allTables.forEach((t) => n.delete(t)); return n; });
+      } else {
+        next.add(schemaName);
+        setSelectedTables((st) => { const n = new Set(st); allTables.forEach((t) => n.add(t)); return n; });
+      }
+      return next;
+    });
+  }
+
+  function toggleTable(schemaName: string, tableName: string) {
+    const key = `${schemaName}.${tableName}`;
+    setSelectedTables((prev) => { const next = new Set(prev); if (next.has(key)) next.delete(key); else next.add(key); return next; });
+  }
+
+  function handleSave() {
+    onSave({
+      days: [...days],
+      time,
+      format,
+      schemas: scope === 'selected' ? [...selectedSchemas] : [],
+      tables: scope === 'selected' ? [...selectedTables] : [],
+      scope,
+      dataOnly,
+      schemaOnly,
+      noOwner,
+      noPrivileges,
+      outputDir: backupDir,
+      enabled: true,
+    });
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={onClose}>
+      <div className="glass-panel-strong flex h-[80vh] w-[600px] max-w-[90vw] flex-col overflow-hidden rounded-2xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex h-10 shrink-0 items-center justify-between border-b border-black/5 px-4">
+          <span className="text-[14px] font-medium text-black">{existing ? 'Modify Backup Schedule' : 'Schedule Backup'}</span>
+          <button className="text-[18px] text-gray-400 hover:text-black" onClick={onClose} type="button">&times;</button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          <div className="mb-4">
+            <label className="mb-2 block text-[12px] font-medium text-black">Days</label>
+            <div className="flex gap-1.5">
+              {ALL_DAYS.map((day) => (
+                <button
+                  key={day}
+                  className={classNames('rounded-lg border px-3 py-1.5 text-[12px]', days.has(day) ? 'border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--accent)]' : 'border-black/10 text-gray-500 hover:text-black')}
+                  onClick={() => toggleDay(day)}
+                  type="button"
+                >
+                  {DAY_LABELS[day]}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Start Time</label>
+            <input type="time" className="input w-32 text-[12px]" value={time} onChange={(e) => setTime(e.target.value)} />
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Format</label>
+            <div className="flex gap-2">
+              {(['tar', 'custom', 'sql'] as const).map((f) => (
+                <button key={f} className={classNames('rounded-lg border px-3 py-1.5 text-[12px]', format === f ? 'border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--accent)]' : 'border-black/10 text-gray-500 hover:text-black')} onClick={() => setFormat(f)} type="button">
+                  {f === 'tar' ? 'Tar' : f === 'custom' ? 'Custom' : 'SQL'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Scope</label>
+            <div className="mb-2 flex gap-3">
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="radio" checked={scope === 'full'} onChange={() => setScope('full')} /> Entire Database</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="radio" checked={scope === 'selected'} onChange={() => setScope('selected')} /> Selected Objects</label>
+            </div>
+            {scope === 'selected' ? (
+              <div className="max-h-[150px] overflow-y-auto rounded-lg border border-black/10 bg-white p-2">
+                {tree.length === 0 ? (
+                  <div className="text-[12px] text-gray-400">Connect to a database to see schemas and tables</div>
+                ) : tree.map((schema) => {
+                  const allTables = schema.tables.map((t) => `${schema.name}.${t.name}`);
+                  const allSelected = allTables.length > 0 && allTables.every((t) => selectedTables.has(t));
+                  const someSelected = allTables.some((t) => selectedTables.has(t));
+                  const expanded = expandedSchemas.has(schema.name);
+                  return (
+                    <div key={schema.name}>
+                      <div className="flex items-center gap-2 py-0.5">
+                        <button className="w-4 shrink-0 text-center text-gray-500" onClick={() => setExpandedSchemas((p) => { const n = new Set(p); if (n.has(schema.name)) n.delete(schema.name); else n.add(schema.name); return n; })} type="button">{expanded ? '\u25BE' : '\u25B8'}</button>
+                        <input type="checkbox" checked={allSelected} ref={(el) => { if (el) el.indeterminate = someSelected && !allSelected; }} onChange={() => toggleSchema(schema.name)} />
+                        <span className="text-[12px] font-medium text-black">{schema.name}</span>
+                      </div>
+                      {expanded ? schema.tables.map((table) => (
+                        <div className="flex items-center gap-2 py-0.5 pl-10" key={table.name}>
+                          <input type="checkbox" checked={selectedTables.has(`${schema.name}.${table.name}`)} onChange={() => toggleTable(schema.name, table.name)} />
+                          <span className="text-[12px] text-black">{table.name}</span>
+                        </div>
+                      )) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Content</label>
+            <div className="flex gap-3">
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="radio" checked={!dataOnly && !schemaOnly} onChange={() => { setDataOnly(false); setSchemaOnly(false); }} /> Schema + Data</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="radio" checked={schemaOnly} onChange={() => { setSchemaOnly(true); setDataOnly(false); }} /> Schema Only</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="radio" checked={dataOnly} onChange={() => { setDataOnly(true); setSchemaOnly(false); }} /> Data Only</label>
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-2 block text-[12px] font-medium text-black">Options</label>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={noOwner} onChange={(e) => setNoOwner(e.target.checked)} /> Do not output owner</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={noPrivileges} onChange={(e) => setNoPrivileges(e.target.checked)} /> Do not output privileges</label>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-black/5 px-5 py-3">
+          <button className="rounded-lg border border-black/10 px-4 py-1.5 text-[12px] text-gray-500 hover:text-black" onClick={onClose} type="button">Cancel</button>
+          <button className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-[12px] text-white hover:opacity-90" onClick={handleSave} type="button">{existing ? 'Update Schedule' : 'Add Backup Schedule'}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BackupModal({ tree, database, backupDir, onClose, onExecute }: {
+  tree: SchemaNode[];
+  database: string;
+  backupDir: string;
+  onClose: () => void;
+  onExecute: (options: BackupOptions) => void;
+}) {
+  const [format, setFormat] = useState('tar');
+  const [scope, setScope] = useState<'full' | 'selected'>('full');
+  const [selectedSchemas, setSelectedSchemas] = useState<Set<string>>(new Set());
+  const [selectedTables, setSelectedTables] = useState<Set<string>>(new Set());
+  const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set());
+  const [dataOnly, setDataOnly] = useState(false);
+  const [schemaOnly, setSchemaOnly] = useState(false);
+  const [noOwner, setNoOwner] = useState(true);
+  const [noPrivileges, setNoPrivileges] = useState(true);
+  const [clean, setClean] = useState(false);
+  const [createDb, setCreateDb] = useState(false);
+  const [ifExists, setIfExists] = useState(false);
+  const [compress, setCompress] = useState(0);
+
+  const defaultFileName = useMemo(() => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const ext = format === 'custom' ? '.dump' : format === 'tar' ? '.tar' : format === 'directory' ? '' : '.sql';
+    return `${database}_${timestamp}${ext}`;
+  }, [database, format]);
+
+  const [outputPath, setOutputPath] = useState(() => {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    return `${backupDir}/${database}_${timestamp}.tar`;
+  });
+
+  // Update extension when format changes
+  useEffect(() => {
+    setOutputPath((prev) => {
+      const dir = prev.substring(0, prev.lastIndexOf('/'));
+      return `${dir}/${defaultFileName}`;
+    });
+  }, [format, defaultFileName]);
+
+  async function browseOutputPath() {
+    const ext = format === 'custom' ? 'dump' : format === 'tar' ? 'tar' : 'sql';
+    const result = await api.showSaveDialog({
+      defaultPath: outputPath,
+      filters: [{ name: 'Backup Files', extensions: [ext] }],
+    });
+    if (result) setOutputPath(result);
+  }
+
+  function toggleSchema(schemaName: string) {
+    const schema = tree.find((s) => s.name === schemaName);
+    if (!schema) return;
+    const allTables = schema.tables.map((t) => `${schemaName}.${t.name}`);
+    setSelectedSchemas((prev) => {
+      const next = new Set(prev);
+      if (next.has(schemaName)) {
+        next.delete(schemaName);
+        setSelectedTables((st) => { const n = new Set(st); allTables.forEach((t) => n.delete(t)); return n; });
+      } else {
+        next.add(schemaName);
+        setSelectedTables((st) => { const n = new Set(st); allTables.forEach((t) => n.add(t)); return n; });
+      }
+      return next;
+    });
+  }
+
+  function toggleTable(schemaName: string, tableName: string) {
+    const key = `${schemaName}.${tableName}`;
+    setSelectedTables((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  }
+
+  function toggleExpandSchema(schemaName: string) {
+    setExpandedSchemas((prev) => {
+      const next = new Set(prev);
+      if (next.has(schemaName)) next.delete(schemaName); else next.add(schemaName);
+      return next;
+    });
+  }
+
+  function handleExecute() {
+    const options: BackupOptions = { filePath: outputPath, format, noOwner, noPrivileges };
+    if (scope === 'selected') {
+      if (selectedSchemas.size > 0 && selectedTables.size === 0) {
+        options.schemas = [...selectedSchemas];
+      } else if (selectedTables.size > 0) {
+        options.tables = [...selectedTables];
+      }
+    }
+    if (dataOnly) options.dataOnly = true;
+    if (schemaOnly) options.schemaOnly = true;
+    if (clean) options.clean = true;
+    if (createDb) options.createDb = true;
+    if (ifExists) options.ifExists = true;
+    if (compress > 0) options.compress = compress;
+    onExecute(options);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm" onClick={onClose}>
+      <div className="glass-panel-strong flex h-[80vh] w-[600px] max-w-[90vw] flex-col overflow-hidden rounded-2xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex h-10 shrink-0 items-center justify-between border-b border-black/5 px-4">
+          <span className="text-[14px] font-medium text-black">Backup Database</span>
+          <button className="text-[18px] text-gray-400 hover:text-black" onClick={onClose} type="button">&times;</button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Format</label>
+            <div className="flex gap-2">
+              {(['tar', 'custom', 'sql', 'directory'] as const).map((f) => (
+                <button
+                  key={f}
+                  className={classNames('rounded-lg border px-3 py-1.5 text-[12px]', format === f ? 'border-[var(--accent)] bg-[var(--accent)]/10 text-[var(--accent)]' : 'border-black/10 text-gray-500 hover:text-black')}
+                  onClick={() => setFormat(f)}
+                  type="button"
+                >
+                  {f === 'tar' ? 'Tar Archive' : f === 'custom' ? 'Custom (pg_restore)' : f === 'sql' ? 'Plain SQL' : 'Directory'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Scope</label>
+            <div className="mb-2 flex gap-3">
+              <label className="flex items-center gap-1.5 text-[12px] text-black">
+                <input type="radio" checked={scope === 'full'} onChange={() => setScope('full')} /> Entire Database
+              </label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black">
+                <input type="radio" checked={scope === 'selected'} onChange={() => setScope('selected')} /> Selected Objects
+              </label>
+            </div>
+            {scope === 'selected' ? (
+              <div className="max-h-[200px] overflow-y-auto rounded-lg border border-black/10 bg-white p-2">
+                {tree.length === 0 ? (
+                  <div className="text-[12px] text-gray-400">Connect to a database to see schemas and tables</div>
+                ) : tree.map((schema) => {
+                  const allTables = schema.tables.map((t) => `${schema.name}.${t.name}`);
+                  const allSelected = allTables.length > 0 && allTables.every((t) => selectedTables.has(t));
+                  const someSelected = allTables.some((t) => selectedTables.has(t));
+                  const expanded = expandedSchemas.has(schema.name);
+                  return (
+                    <div key={schema.name}>
+                      <div className="flex items-center gap-2 py-0.5">
+                        <button className="w-4 shrink-0 text-center text-gray-500" onClick={() => toggleExpandSchema(schema.name)} type="button">{expanded ? '\u25BE' : '\u25B8'}</button>
+                        <input
+                          type="checkbox"
+                          checked={allSelected}
+                          ref={(el) => { if (el) el.indeterminate = someSelected && !allSelected; }}
+                          onChange={() => toggleSchema(schema.name)}
+                        />
+                        <span className="text-[12px] font-medium text-black">{schema.name}</span>
+                        <span className="text-[11px] text-gray-400">{schema.tables.length} tables</span>
+                      </div>
+                      {expanded ? schema.tables.map((table) => (
+                        <div className="flex items-center gap-2 py-0.5 pl-10" key={table.name}>
+                          <input
+                            type="checkbox"
+                            checked={selectedTables.has(`${schema.name}.${table.name}`)}
+                            onChange={() => toggleTable(schema.name, table.name)}
+                          />
+                          <span className="text-[12px] text-black">{table.name}</span>
+                          <span className="text-[10px] text-gray-400">{table.tableType === 'VIEW' ? 'view' : ''}</span>
+                        </div>
+                      )) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : null}
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-1 block text-[12px] font-medium text-black">Content</label>
+            <div className="flex gap-3">
+              <label className="flex items-center gap-1.5 text-[12px] text-black">
+                <input type="radio" checked={!dataOnly && !schemaOnly} onChange={() => { setDataOnly(false); setSchemaOnly(false); }} /> Schema + Data
+              </label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black">
+                <input type="radio" checked={schemaOnly} onChange={() => { setSchemaOnly(true); setDataOnly(false); }} /> Schema Only
+              </label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black">
+                <input type="radio" checked={dataOnly} onChange={() => { setDataOnly(true); setSchemaOnly(false); }} /> Data Only
+              </label>
+            </div>
+          </div>
+
+          <div className="mb-4">
+            <label className="mb-2 block text-[12px] font-medium text-black">Options</label>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1.5">
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={noOwner} onChange={(e) => setNoOwner(e.target.checked)} /> Do not output owner</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={noPrivileges} onChange={(e) => setNoPrivileges(e.target.checked)} /> Do not output privileges</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={clean} onChange={(e) => setClean(e.target.checked)} /> Clean (DROP before CREATE)</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={createDb} onChange={(e) => setCreateDb(e.target.checked)} /> Include CREATE DATABASE</label>
+              <label className="flex items-center gap-1.5 text-[12px] text-black"><input type="checkbox" checked={ifExists} onChange={(e) => setIfExists(e.target.checked)} /> Use IF EXISTS with DROP</label>
+            </div>
+          </div>
+
+          {format === 'custom' || format === 'directory' ? (
+            <div className="mb-4">
+              <label className="mb-1 block text-[12px] font-medium text-black">Compression Level (0=none, 9=max)</label>
+              <input type="range" min={0} max={9} value={compress} onChange={(e) => setCompress(Number(e.target.value))} className="w-48" />
+              <span className="ml-2 text-[12px] text-gray-500">{compress}</span>
+            </div>
+          ) : null}
+
+          <div>
+            <label className="mb-1 block text-[12px] font-medium text-black">Output File</label>
+            <div className="flex items-center gap-2">
+              <input
+                className="input flex-1 text-[12px]"
+                value={outputPath}
+                onChange={(e) => setOutputPath(e.target.value)}
+              />
+              <button className="shrink-0 rounded-lg border border-black/10 px-3 py-1.5 text-[12px] text-gray-500 hover:text-black" onClick={() => void browseOutputPath()} type="button">Browse</button>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-black/5 px-5 py-3">
+          <button className="rounded-lg border border-black/10 px-4 py-1.5 text-[12px] text-gray-500 hover:text-black" onClick={onClose} type="button">Cancel</button>
+          <button className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-[12px] text-white hover:opacity-90" onClick={handleExecute} type="button">Start Backup</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MarkdownViewer({ content }: { content: string }) {
+  const html = useMemo(() => {
+    let result = content
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    // Headings
+    result = result.replace(/^### (.+)$/gm, '<h3 class="mt-5 mb-2 text-[15px] font-semibold text-black">$1</h3>');
+    result = result.replace(/^## (.+)$/gm, '<h2 class="mt-6 mb-2 text-[17px] font-bold text-black border-b border-black/10 pb-1">$1</h2>');
+    result = result.replace(/^# (.+)$/gm, '<h1 class="mt-4 mb-3 text-[22px] font-bold text-black">$1</h1>');
+
+    // Horizontal rules
+    result = result.replace(/^---$/gm, '<hr class="my-4 border-black/10" />');
+
+    // Bold and italic
+    result = result.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    result = result.replace(/\*(.+?)\*/g, '<em>$1</em>');
+
+    // Inline code
+    result = result.replace(/`([^`]+)`/g, '<code class="rounded bg-black/5 px-1 py-0.5 text-[12px] font-mono">$1</code>');
+
+    // Tables
+    result = result.replace(/^\|(.+)\|$/gm, (match) => {
+      const cells = match.split('|').filter(Boolean).map((c) => c.trim());
+      if (cells.every((c) => /^[-:]+$/.test(c))) return '';
+      const tag = match.includes('---') ? 'th' : 'td';
+      const row = cells.map((c) => `<${tag} class="border border-black/10 px-3 py-1.5 text-left text-[12px]">${c}</${tag}>`).join('');
+      return `<tr>${row}</tr>`;
+    });
+    result = result.replace(/(<tr>.*<\/tr>\n?)+/g, (block) =>
+      `<table class="my-2 w-full border-collapse text-[12px]">${block}</table>`
+    );
+
+    // Lists
+    result = result.replace(/^(\d+)\. (.+)$/gm, '<li class="ml-4 list-decimal text-[13px] text-black leading-relaxed">$2</li>');
+    result = result.replace(/^- (.+)$/gm, '<li class="ml-4 list-disc text-[13px] text-black leading-relaxed">$1</li>');
+
+    // Paragraphs
+    result = result.replace(/\n\n/g, '</p><p class="mb-2 text-[13px] leading-relaxed text-black/80">');
+    result = '<p class="mb-2 text-[13px] leading-relaxed text-black/80">' + result + '</p>';
+
+    // Clean up empty paragraphs
+    result = result.replace(/<p[^>]*>\s*<\/p>/g, '');
+
+    return result;
+  }, [content]);
+
+  return <div dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function DropdownMenu({ label, active, onToggle, children }: PropsWithChildren<{ label: string; active: boolean; onToggle: () => void }>) {
+  return (
+    <div className="relative" onClick={(e) => e.stopPropagation()}>
+      <button
+        className={classNames(
+          'rounded-md px-2 py-1 text-[12px] text-black/60 hover:bg-black/5 hover:text-black',
+          active && 'bg-black/5 text-black',
+        )}
+        onClick={onToggle}
+        type="button"
+      >
+        {label}
+      </button>
+      {active ? (
+        <div className="context-menu absolute left-0 top-full z-50 mt-1 min-w-[220px] rounded-lg py-1 text-[12px] text-black">
+          {children}
+        </div>
+      ) : null}
+    </div>
   );
 }
 

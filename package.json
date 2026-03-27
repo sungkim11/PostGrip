@@ -31,6 +31,7 @@
     },
     "files": [
       "dist/**/*",
+      "docs/**/*",
       "node_modules/**/*",
       "!node_modules/ssh2/lib/protocol/crypto/build",
       "package.json"

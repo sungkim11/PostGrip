@@ -253,6 +253,15 @@ export async function getActiveQueries(conn: SavedConnection): Promise<ActiveQue
   }
 }
 
+export async function executeSql(conn: SavedConnection, sql: string): Promise<void> {
+  const client = await connect(conn);
+  try {
+    await client.query(sql);
+  } finally {
+    client.release();
+  }
+}
+
 export async function testConnection(conn: SavedConnection): Promise<void> {
   const client = await connect(conn);
   try {

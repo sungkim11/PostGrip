@@ -1,4 +1,4 @@
-import type { ActiveQuery, AlterTableAction, AppSnapshot, ConnectionInput, DdlResult, DmlOperation, EditableTableData, FileEntry, GitRepo, GitStatus, HostStats, ModifyTableInfo, PgpassEntry, QueryResult } from './types';
+import type { ActiveQuery, AlterTableAction, AppInfo, AppSnapshot, BackupEntry, BackupOptions, BackupSchedule, ConnectionInput, DdlResult, DmlOperation, EditableTableData, FileEntry, GitRepo, GitStatus, HostStats, ModifyTableInfo, PgpassEntry, QueryResult } from './types';
 
 interface ElectronAPI {
   bootstrap(): Promise<AppSnapshot>;
@@ -26,10 +26,23 @@ interface ElectronAPI {
   listDirectory(dirPath: string): Promise<FileEntry[]>;
   readTextFile(filePath: string): Promise<string>;
   getHomeDir(): Promise<string>;
+  getAppInfo(): Promise<AppInfo>;
+  readHelp(): Promise<string>;
   findGitRepos(dirPath: string): Promise<GitRepo[]>;
   gitRepoRoot(dirPath: string): Promise<string | null>;
   gitStatus(repoPath: string): Promise<GitStatus | null>;
   gitDiff(repoPath: string, filePath: string): Promise<string | null>;
+  listBackups(dirPath: string): Promise<BackupEntry[]>;
+  getBackupDir(): Promise<string>;
+  setBackupDir(dirPath: string): Promise<void>;
+  listBackupSchedules(): Promise<BackupSchedule[]>;
+  addBackupSchedule(schedule: Omit<BackupSchedule, 'id' | 'createdAt'>): Promise<BackupSchedule>;
+  updateBackupSchedule(id: string, updates: Partial<BackupSchedule>): Promise<BackupSchedule[]>;
+  deleteBackupSchedule(id: string): Promise<BackupSchedule[]>;
+  deleteBackup(filePath: string): Promise<void>;
+  backupDatabase(options: BackupOptions): Promise<{ durationMs: number }>;
+  restoreDatabase(filePath: string): Promise<void>;
+  showOpenDialog(options: { filters?: Array<{ name: string; extensions: string[] }>; properties?: string[] }): Promise<string | null>;
   closeWindow(): Promise<void>;
 }
 

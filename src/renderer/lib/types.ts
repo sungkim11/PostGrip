@@ -152,6 +152,83 @@ export interface AlterTableAction {
   newTableName?: string;
 }
 
+export interface BackupOptions {
+  filePath: string;
+  format: string;
+  schemas?: string[];
+  tables?: string[];
+  dataOnly?: boolean;
+  schemaOnly?: boolean;
+  noOwner?: boolean;
+  noPrivileges?: boolean;
+  clean?: boolean;
+  createDb?: boolean;
+  ifExists?: boolean;
+  compress?: number;
+  verbose?: boolean;
+  blobs?: boolean;
+  noBlobs?: boolean;
+}
+
+export interface BackupMeta {
+  database: string;
+  host: string;
+  port: number;
+  user: string;
+  format: string;
+  schemas: string[];
+  tables: string[];
+  scope: string;
+  dataOnly: boolean;
+  schemaOnly: boolean;
+  noOwner: boolean;
+  noPrivileges: boolean;
+  clean: boolean;
+  createDb: boolean;
+  ifExists: boolean;
+  compress: number;
+  createdAt: string;
+  durationMs: number;
+}
+
+export interface BackupSchedule {
+  id: string;
+  days: string[];
+  time: string;
+  format: string;
+  schemas: string[];
+  tables: string[];
+  scope: string;
+  dataOnly: boolean;
+  schemaOnly: boolean;
+  noOwner: boolean;
+  noPrivileges: boolean;
+  outputDir: string;
+  enabled: boolean;
+  createdAt: string;
+  lastRun?: string;
+}
+
+export interface BackupEntry {
+  name: string;
+  path: string;
+  size: number;
+  modified: string;
+  status?: 'completed' | 'in_progress' | 'failed';
+  durationMs?: number;
+  error?: string;
+  meta?: BackupMeta;
+}
+
+export interface AppInfo {
+  name: string;
+  version: string;
+  electronVersion: string;
+  nodeVersion: string;
+  chromiumVersion: string;
+  platform: string;
+}
+
 export interface GitFileStatus {
   status: string;
   path: string;

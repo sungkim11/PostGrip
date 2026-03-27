@@ -1,4 +1,4 @@
-import { ipcMain, dialog, BrowserWindow } from 'electron';
+import { app, ipcMain, dialog, BrowserWindow } from 'electron';
 import { appState } from './state';
 import { loadConnections, saveConnections } from './storage';
 import * as postgres from './postgres';
@@ -20,6 +20,26 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+
+function findPgTool(name: string): string {
+  const candidates = [
+    name, // PATH
+    `/opt/homebrew/bin/${name}`,
+    `/opt/homebrew/opt/libpq/bin/${name}`,
+    `/usr/local/bin/${name}`,
+    `/usr/local/opt/libpq/bin/${name}`,
+    `/usr/lib/postgresql/16/bin/${name}`,
+    `/usr/lib/postgresql/15/bin/${name}`,
+    `/usr/lib/postgresql/14/bin/${name}`,
+  ];
+  for (const c of candidates) {
+    try {
+      fs.accessSync(c, fs.constants.X_OK);
+      return c;
+    } catch { /* try next */ }
+  }
+  return name; // fall back to bare name, let it fail with a clear error
+}
 
 function snapshot(): AppSnapshot {
   const savedConnections = loadConnections().map(toSafe);
@@ -194,7 +214,266 @@ export function registerIpcHandlers(): void {
     }
 
     const env = { ...process.env, PGPASSWORD: conn.password };
-    await execFileAsync('pg_dump', args, { env, timeout: 120000 });
+    await execFileAsync(findPgTool('pg_dump'), args, { env, timeout: 120000 });
+  });
+
+  ipcMain.handle('list-backups', async (_event, dirPath: string) => {
+    try {
+      const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+      const backups: Array<{ name: string; path: string; size: number; modified: string; meta?: Record<string, unknown> }> = [];
+      for (const e of entries) {
+        if (!e.isFile()) continue;
+        if (!/\.(sql|dump|tar)$/i.test(e.name)) continue;
+        try {
+          const fullPath = path.join(dirPath, e.name);
+          const stat = await fs.promises.stat(fullPath);
+          let meta: Record<string, unknown> | undefined;
+          try {
+            const metaContent = await fs.promises.readFile(fullPath + '.meta.json', 'utf-8');
+            meta = JSON.parse(metaContent);
+          } catch { /* no metadata */ }
+          backups.push({
+            name: e.name,
+            path: fullPath,
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+            meta,
+          });
+        } catch { /* skip */ }
+      }
+      backups.sort((a, b) => b.modified.localeCompare(a.modified));
+      return backups;
+    } catch {
+      return [];
+    }
+  });
+
+  ipcMain.handle('get-backup-dir', () => {
+    const prefPath = path.join(app.getPath('userData'), 'backup_dir.txt');
+    let backupDir: string;
+    try {
+      backupDir = fs.readFileSync(prefPath, 'utf-8').trim();
+    } catch {
+      backupDir = path.join(os.homedir(), 'PostGrip_Backups');
+    }
+    try { fs.mkdirSync(backupDir, { recursive: true }); } catch { /* ignore */ }
+    return backupDir;
+  });
+
+  // --- Backup Schedules ---
+  const schedulesPath = path.join(app.getPath('userData'), 'backup_schedules.json');
+
+  function loadSchedules(): Array<Record<string, unknown>> {
+    try { return JSON.parse(fs.readFileSync(schedulesPath, 'utf-8')); } catch { return []; }
+  }
+  function saveSchedules(schedules: Array<Record<string, unknown>>) {
+    fs.writeFileSync(schedulesPath, JSON.stringify(schedules, null, 2));
+  }
+
+  ipcMain.handle('list-backup-schedules', () => loadSchedules());
+
+  ipcMain.handle('add-backup-schedule', (_event, schedule: Record<string, unknown>) => {
+    const schedules = loadSchedules();
+    schedule.id = require('node:crypto').randomUUID();
+    schedule.createdAt = new Date().toISOString();
+    schedules.push(schedule);
+    saveSchedules(schedules);
+    return schedule;
+  });
+
+  ipcMain.handle('update-backup-schedule', (_event, id: string, updates: Record<string, unknown>) => {
+    const schedules = loadSchedules();
+    const idx = schedules.findIndex((s) => s.id === id);
+    if (idx >= 0) { Object.assign(schedules[idx], updates); saveSchedules(schedules); }
+    return schedules;
+  });
+
+  ipcMain.handle('delete-backup-schedule', (_event, id: string) => {
+    const schedules = loadSchedules().filter((s) => s.id !== id);
+    saveSchedules(schedules);
+    return schedules;
+  });
+
+  // Check schedules every minute and run due backups
+  setInterval(async () => {
+    if (!appState.activeConnection) return;
+    const schedules = loadSchedules();
+    const now = new Date();
+    const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+    const currentDay = dayNames[now.getDay()];
+    const currentTime = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+
+    for (const schedule of schedules) {
+      if (!(schedule.enabled !== false)) continue;
+      const days = schedule.days as string[] ?? [];
+      if (!days.includes(currentDay)) continue;
+      if (schedule.time !== currentTime) continue;
+      // Prevent running same schedule twice in the same minute
+      const lastRun = schedule.lastRun as string | undefined;
+      if (lastRun && new Date(lastRun).getTime() > now.getTime() - 120000) continue;
+
+      // Run the backup
+      try {
+        const conn = appState.activeConnection;
+        const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        const fmt = (schedule.format as string) || 'tar';
+        const ext = fmt === 'custom' ? '.dump' : fmt === 'tar' ? '.tar' : '.sql';
+        const backupDirPref = path.join(app.getPath('userData'), 'backup_dir.txt');
+        let bDir: string;
+        try { bDir = fs.readFileSync(backupDirPref, 'utf-8').trim(); } catch { bDir = path.join(os.homedir(), 'PostGrip_Backups'); }
+        try { fs.mkdirSync(bDir, { recursive: true }); } catch { /* ignore */ }
+
+        const filePath = (schedule.outputDir as string || bDir) + `/${conn.database}_scheduled_${timestamp}${ext}`;
+        const args = ['-h', conn.host, '-p', String(conn.port), '-U', conn.user, '-d', conn.database, '-f', filePath];
+        if (fmt === 'custom') args.push('-Fc');
+        else if (fmt === 'tar') args.push('-Ft');
+
+        const tables = schedule.tables as string[] ?? [];
+        const schemas = schedule.schemas as string[] ?? [];
+        if (schemas.length) for (const s of schemas) args.push('-n', s);
+        if (tables.length) for (const t of tables) args.push('-t', t);
+        if (schedule.dataOnly) args.push('--data-only');
+        if (schedule.schemaOnly) args.push('--schema-only');
+        if (schedule.noOwner) args.push('--no-owner');
+        if (schedule.noPrivileges) args.push('--no-acl');
+
+        const env = { ...process.env, PGPASSWORD: conn.password };
+        const startTime = Date.now();
+        await execFileAsync(findPgTool('pg_dump'), args, { env, timeout: 600000 });
+        const durationMs = Date.now() - startTime;
+
+        // Save metadata
+        const meta = { database: conn.database, host: conn.host, port: conn.port, user: conn.user, format: fmt, schemas, tables, scope: (schemas.length || tables.length) ? 'selected' : 'full', dataOnly: !!schedule.dataOnly, schemaOnly: !!schedule.schemaOnly, noOwner: !!schedule.noOwner, noPrivileges: !!schedule.noPrivileges, clean: false, createDb: false, ifExists: false, compress: 0, createdAt: now.toISOString(), durationMs, scheduled: true, scheduleId: schedule.id };
+        try { fs.writeFileSync(filePath + '.meta.json', JSON.stringify(meta, null, 2)); } catch { /* ignore */ }
+
+        // Update lastRun
+        schedule.lastRun = now.toISOString();
+        saveSchedules(schedules);
+      } catch { /* log error but continue */ }
+    }
+  }, 60000);
+
+  ipcMain.handle('set-backup-dir', (_event, dirPath: string) => {
+    const prefPath = path.join(app.getPath('userData'), 'backup_dir.txt');
+    try { fs.mkdirSync(dirPath, { recursive: true }); } catch { /* ignore */ }
+    fs.writeFileSync(prefPath, dirPath);
+  });
+
+  ipcMain.handle('delete-backup', async (_event, filePath: string) => {
+    await fs.promises.unlink(filePath);
+  });
+
+  ipcMain.handle('backup-database', async (_event, options: {
+    filePath: string;
+    format: string;
+    schemas?: string[];
+    tables?: string[];
+    dataOnly?: boolean;
+    schemaOnly?: boolean;
+    noOwner?: boolean;
+    noPrivileges?: boolean;
+    clean?: boolean;
+    createDb?: boolean;
+    ifExists?: boolean;
+    compress?: number;
+    verbose?: boolean;
+    blobs?: boolean;
+    noBlobs?: boolean;
+  }) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    const conn = appState.activeConnection;
+    const args = [
+      '-h', conn.host,
+      '-p', String(conn.port),
+      '-U', conn.user,
+      '-d', conn.database,
+      '-f', options.filePath,
+    ];
+
+    // Format
+    if (options.format === 'custom') args.push('-Fc');
+    else if (options.format === 'tar') args.push('-Ft');
+    else if (options.format === 'directory') args.push('-Fd');
+    // else plain SQL (default)
+
+    // Scope
+    if (options.schemas?.length) {
+      for (const s of options.schemas) { args.push('-n', s); }
+    }
+    if (options.tables?.length) {
+      for (const t of options.tables) { args.push('-t', t); }
+    }
+
+    // Options
+    if (options.dataOnly) args.push('--data-only');
+    if (options.schemaOnly) args.push('--schema-only');
+    if (options.noOwner) args.push('--no-owner');
+    if (options.noPrivileges) args.push('--no-acl');
+    if (options.clean) args.push('--clean');
+    if (options.createDb) args.push('--create');
+    if (options.ifExists) args.push('--if-exists');
+    if (options.compress != null && options.compress > 0) args.push(`-Z${options.compress}`);
+    if (options.verbose) args.push('--verbose');
+    if (options.blobs) args.push('--blobs');
+    if (options.noBlobs) args.push('--no-blobs');
+
+    const env = { ...process.env, PGPASSWORD: conn.password };
+    const startTime = Date.now();
+    await execFileAsync(findPgTool('pg_dump'), args, { env, timeout: 600000 });
+    const durationMs = Date.now() - startTime;
+
+    // Save metadata alongside the backup
+    const meta = {
+      database: conn.database,
+      host: conn.host,
+      port: conn.port,
+      user: conn.user,
+      format: options.format,
+      schemas: options.schemas ?? [],
+      tables: options.tables ?? [],
+      scope: (options.schemas?.length || options.tables?.length) ? 'selected' : 'full',
+      dataOnly: !!options.dataOnly,
+      schemaOnly: !!options.schemaOnly,
+      noOwner: !!options.noOwner,
+      noPrivileges: !!options.noPrivileges,
+      clean: !!options.clean,
+      createDb: !!options.createDb,
+      ifExists: !!options.ifExists,
+      compress: options.compress ?? 0,
+      createdAt: new Date().toISOString(),
+      durationMs,
+    };
+    try { fs.writeFileSync(options.filePath + '.meta.json', JSON.stringify(meta, null, 2)); } catch { /* ignore */ }
+
+    return { durationMs };
+  });
+
+  ipcMain.handle('restore-database', async (_event, filePath: string) => {
+    if (!appState.activeConnection) throw new Error('No active database connection');
+    const conn = appState.activeConnection;
+    const ext = filePath.toLowerCase();
+
+    if (ext.endsWith('.sql')) {
+      const sql = await fs.promises.readFile(filePath, 'utf-8');
+      await postgres.executeSql(conn, sql);
+    } else {
+      const args = [
+        '-h', conn.host,
+        '-p', String(conn.port),
+        '-U', conn.user,
+        '-d', conn.database,
+        filePath,
+      ];
+      const env = { ...process.env, PGPASSWORD: conn.password };
+      await execFileAsync(findPgTool('pg_restore'), args, { env, timeout: 600000 });
+    }
+  });
+
+  ipcMain.handle('show-open-dialog', async (_event, options: Electron.OpenDialogOptions) => {
+    const win = BrowserWindow.getFocusedWindow();
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, options);
+    return result.canceled ? null : result.filePaths[0] ?? null;
   });
 
   ipcMain.handle('show-save-dialog', async (_event, options: Electron.SaveDialogOptions) => {
@@ -231,6 +510,32 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle('get-home-dir', () => {
     return os.homedir();
+  });
+
+  ipcMain.handle('get-app-info', () => {
+    const pkg = require('../../package.json');
+    return {
+      name: pkg.productName || pkg.name,
+      version: pkg.version,
+      electronVersion: process.versions.electron,
+      nodeVersion: process.versions.node,
+      chromiumVersion: process.versions.chrome,
+      platform: `${process.platform} ${process.arch}`,
+    };
+  });
+
+  ipcMain.handle('read-help', async () => {
+    // Try bundled docs/help.md first, then fall back to development path
+    const candidates = [
+      path.join(__dirname, '../../docs/help.md'),
+      path.join(__dirname, '../../../docs/help.md'),
+    ];
+    for (const p of candidates) {
+      try {
+        return await fs.promises.readFile(p, 'utf-8');
+      } catch { /* try next */ }
+    }
+    return '# Help\n\nHelp file not found.';
   });
 
   ipcMain.handle('find-git-repos', async (_event, dirPath: string) => {
