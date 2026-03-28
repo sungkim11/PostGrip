@@ -86,21 +86,18 @@ test.describe('Connected Database Flow', () => {
     await expect(page.locator('thead th').first()).toBeVisible({ timeout: 15000 });
   });
 
-  test('right-click table shows context menu and Show DDL works', async () => {
+  test('right-click table shows context menu with expected items', async () => {
     const draggableRows = page.locator('.sidebar-scroll [draggable="true"]');
     const count = await draggableRows.count();
     test.skip(count === 0, 'No tables');
 
     await draggableRows.first().click({ button: 'right' });
 
-    await expect(page.getByText('Show DDL')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText('Modify Table')).toBeVisible({ timeout: 5000 });
     await expect(page.getByText('Edit Data')).toBeVisible();
-    await expect(page.getByText('Modify Table')).toBeVisible();
+    await expect(page.getByText('Export CSV')).toBeVisible();
+    await expect(page.getByText('Export Parquet')).toBeVisible();
     await expect(page.getByText('Truncate Table')).toBeVisible();
     await expect(page.getByText('Drop Table')).toBeVisible();
-
-    // Click Show DDL
-    await page.getByText('Show DDL').click();
-    await expect(page.getByText('create table')).toBeVisible({ timeout: 10000 });
   });
 });

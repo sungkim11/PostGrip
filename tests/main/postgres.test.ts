@@ -25,6 +25,7 @@ vi.mock('pg', () => ({
 }));
 
 import * as postgres from '../../src/main/postgres';
+import { validateDefault, validateDataType, quoteColumnList, quoteTableRef } from '../../src/main/postgres';
 
 describe('postgres', () => {
   const conn = testConnection();
@@ -653,6 +654,294 @@ describe('postgres', () => {
       expect(data.connectionsByState).toEqual([]);
       expect(data.tableStats).toEqual([]);
       expect(data.locksByType).toEqual([]);
+    });
+  });
+
+  describe('validateDefault', () => {
+    it('accepts integer literals', () => {
+      expect(validateDefault('42')).toBe('42');
+      expect(validateDefault('0')).toBe('0');
+    });
+
+    it('accepts decimal literals', () => {
+      expect(validateDefault('3.14')).toBe('3.14');
+      expect(validateDefault('0.5')).toBe('0.5');
+    });
+
+    it('accepts string literals', () => {
+      expect(validateDefault("'hello'")).toBe("'hello'");
+      expect(validateDefault("'it''s fine'")).toBe("'it''s fine'");
+      expect(validateDefault("''")).toBe("''");
+    });
+
+    it('accepts NULL', () => {
+      expect(validateDefault('NULL')).toBe('NULL');
+      expect(validateDefault('null')).toBe('null');
+    });
+
+    it('accepts boolean literals', () => {
+      expect(validateDefault('TRUE')).toBe('TRUE');
+      expect(validateDefault('FALSE')).toBe('FALSE');
+      expect(validateDefault('true')).toBe('true');
+    });
+
+    it('accepts timestamp functions', () => {
+      expect(validateDefault('CURRENT_TIMESTAMP')).toBe('CURRENT_TIMESTAMP');
+      expect(validateDefault('CURRENT_DATE')).toBe('CURRENT_DATE');
+      expect(validateDefault('NOW()')).toBe('NOW()');
+    });
+
+    it('accepts gen_random_uuid()', () => {
+      expect(validateDefault('gen_random_uuid()')).toBe('gen_random_uuid()');
+    });
+
+    it('accepts nextval sequences', () => {
+      expect(validateDefault("nextval('my_seq')")).toBe("nextval('my_seq')");
+    });
+
+    it('trims whitespace', () => {
+      expect(validateDefault('  42  ')).toBe('42');
+    });
+
+    it('rejects SQL injection attempts', () => {
+      expect(() => validateDefault("'x'; DROP TABLE users; --")).toThrow('Unsafe DEFAULT');
+      expect(() => validateDefault('1; DELETE FROM users')).toThrow('Unsafe DEFAULT');
+      expect(() => validateDefault('(SELECT password FROM users LIMIT 1)')).toThrow('Unsafe DEFAULT');
+    });
+
+    it('rejects subqueries', () => {
+      expect(() => validateDefault('(SELECT 1)')).toThrow('Unsafe DEFAULT');
+    });
+
+    it('rejects arbitrary function calls', () => {
+      expect(() => validateDefault('pg_read_file(\'/etc/passwd\')')).toThrow('Unsafe DEFAULT');
+    });
+  });
+
+  describe('validateDataType', () => {
+    it('accepts common PostgreSQL types', () => {
+      expect(validateDataType('integer')).toBe('integer');
+      expect(validateDataType('text')).toBe('text');
+      expect(validateDataType('boolean')).toBe('boolean');
+      expect(validateDataType('bigint')).toBe('bigint');
+      expect(validateDataType('serial')).toBe('serial');
+      expect(validateDataType('uuid')).toBe('uuid');
+      expect(validateDataType('jsonb')).toBe('jsonb');
+      expect(validateDataType('timestamptz')).toBe('timestamptz');
+    });
+
+    it('accepts types with parameters', () => {
+      expect(validateDataType('varchar(255)')).toBe('varchar(255)');
+      expect(validateDataType('numeric(10, 2)')).toBe('numeric(10, 2)');
+      expect(validateDataType('char(1)')).toBe('char(1)');
+    });
+
+    it('accepts array types', () => {
+      expect(validateDataType('integer[]')).toBe('integer[]');
+      expect(validateDataType('text[]')).toBe('text[]');
+    });
+
+    it('accepts multi-word types', () => {
+      expect(validateDataType('double precision')).toBe('double precision');
+      expect(validateDataType('timestamp without time zone')).toBe('timestamp without time zone');
+    });
+
+    it('trims whitespace', () => {
+      expect(validateDataType('  text  ')).toBe('text');
+    });
+
+    it('rejects SQL injection attempts', () => {
+      expect(() => validateDataType('integer); DROP TABLE users; --')).toThrow('Invalid data type');
+      expect(() => validateDataType("text'; DELETE FROM users")).toThrow('Invalid data type');
+    });
+
+    it('rejects empty strings', () => {
+      expect(() => validateDataType('')).toThrow('Invalid data type');
+    });
+
+    it('rejects strings starting with numbers', () => {
+      expect(() => validateDataType('123abc')).toThrow('Invalid data type');
+    });
+  });
+
+  describe('quoteColumnList', () => {
+    it('quotes a single column', () => {
+      expect(quoteColumnList('id')).toBe('"id"');
+    });
+
+    it('quotes multiple columns', () => {
+      expect(quoteColumnList('id, name, email')).toBe('"id", "name", "email"');
+    });
+
+    it('handles columns without spaces after commas', () => {
+      expect(quoteColumnList('id,name')).toBe('"id", "name"');
+    });
+
+    it('escapes double quotes in column names', () => {
+      expect(quoteColumnList('my"col')).toBe('"my""col"');
+    });
+
+    it('trims whitespace from column names', () => {
+      expect(quoteColumnList('  id  ,  name  ')).toBe('"id", "name"');
+    });
+  });
+
+  describe('quoteTableRef', () => {
+    it('quotes a simple table name', () => {
+      expect(quoteTableRef('users')).toBe('"users"');
+    });
+
+    it('quotes schema-qualified table name', () => {
+      expect(quoteTableRef('public.users')).toBe('"public"."users"');
+    });
+
+    it('trims whitespace', () => {
+      expect(quoteTableRef(' public . users ')).toBe('"public"."users"');
+    });
+
+    it('escapes double quotes', () => {
+      expect(quoteTableRef('my"schema.my"table')).toBe('"my""schema"."my""table"');
+    });
+  });
+
+  describe('createSchema', () => {
+    it('executes CREATE SCHEMA with quoted name', async () => {
+      await postgres.createSchema(conn, 'my_schema');
+      expect(queries.some((q) => q.sql === 'CREATE SCHEMA "my_schema"')).toBe(true);
+      expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it('escapes special characters in schema name', async () => {
+      await postgres.createSchema(conn, 'my"schema');
+      expect(queries.some((q) => q.sql === 'CREATE SCHEMA "my""schema"')).toBe(true);
+    });
+
+    it('releases client on error', async () => {
+      mockClient.query.mockRejectedValueOnce(new Error('already exists'));
+      await expect(postgres.createSchema(conn, 'dup')).rejects.toThrow('already exists');
+      expect(mockClient.release).toHaveBeenCalled();
+    });
+  });
+
+  describe('createTable', () => {
+    it('creates a simple table', async () => {
+      await postgres.createTable(conn, 'public', 'users', [
+        { name: 'id', type: 'serial', nullable: false },
+        { name: 'name', type: 'text', nullable: true },
+      ]);
+      const createQuery = queries.find((q) => q.sql.includes('CREATE TABLE'));
+      expect(createQuery).toBeDefined();
+      expect(createQuery!.sql).toContain('"public"."users"');
+      expect(createQuery!.sql).toContain('"id" serial NOT NULL');
+      expect(createQuery!.sql).toContain('"name" text');
+      expect(mockClient.release).toHaveBeenCalled();
+    });
+
+    it('adds primary key constraint', async () => {
+      await postgres.createTable(conn, 'public', 'users', [
+        { name: 'id', type: 'integer', nullable: false, pk: true },
+        { name: 'name', type: 'text', nullable: true },
+      ]);
+      const createQuery = queries.find((q) => q.sql.includes('CREATE TABLE'));
+      expect(createQuery!.sql).toContain('PRIMARY KEY ("id")');
+    });
+
+    it('adds composite primary key', async () => {
+      await postgres.createTable(conn, 'public', 'order_items', [
+        { name: 'order_id', type: 'integer', nullable: false, pk: true },
+        { name: 'item_id', type: 'integer', nullable: false, pk: true },
+      ]);
+      const createQuery = queries.find((q) => q.sql.includes('CREATE TABLE'));
+      expect(createQuery!.sql).toContain('PRIMARY KEY ("order_id", "item_id")');
+    });
+
+    it('adds foreign keys with quoted references', async () => {
+      await postgres.createTable(conn, 'public', 'orders', [
+        { name: 'id', type: 'serial', nullable: false },
+        { name: 'user_id', type: 'integer', nullable: false },
+      ], [
+        { column: 'user_id', refTable: 'public.users', refColumn: 'id' },
+      ]);
+      const createQuery = queries.find((q) => q.sql.includes('CREATE TABLE'));
+      expect(createQuery!.sql).toContain('FOREIGN KEY ("user_id") REFERENCES "public"."users" ("id")');
+    });
+
+    it('creates indexes with quoted column names', async () => {
+      await postgres.createTable(conn, 'public', 'users', [
+        { name: 'email', type: 'text', nullable: false },
+      ], undefined, [
+        { columns: 'email', unique: true },
+      ]);
+      const idxQuery = queries.find((q) => q.sql.includes('CREATE UNIQUE INDEX'));
+      expect(idxQuery).toBeDefined();
+      expect(idxQuery!.sql).toContain('("email")');
+    });
+
+    it('creates multi-column indexes', async () => {
+      await postgres.createTable(conn, 'public', 'users', [
+        { name: 'first', type: 'text', nullable: true },
+        { name: 'last', type: 'text', nullable: true },
+      ], undefined, [
+        { columns: 'first, last' },
+      ]);
+      const idxQuery = queries.find((q) => q.sql.includes('CREATE INDEX'));
+      expect(idxQuery!.sql).toContain('("first", "last")');
+    });
+
+    it('validates data types', async () => {
+      await expect(
+        postgres.createTable(conn, 'public', 'bad', [
+          { name: 'x', type: 'integer); DROP TABLE users; --', nullable: true },
+        ])
+      ).rejects.toThrow('Invalid data type');
+    });
+
+    it('validates default values', async () => {
+      await expect(
+        postgres.createTable(conn, 'public', 'bad', [
+          { name: 'x', type: 'text', nullable: true, defaultValue: "'; DROP TABLE users; --" },
+        ])
+      ).rejects.toThrow('Unsafe DEFAULT');
+    });
+
+    it('accepts valid default values', async () => {
+      await postgres.createTable(conn, 'public', 'test', [
+        { name: 'active', type: 'boolean', nullable: false, defaultValue: 'TRUE' },
+        { name: 'count', type: 'integer', nullable: false, defaultValue: '0' },
+      ]);
+      const createQuery = queries.find((q) => q.sql.includes('CREATE TABLE'));
+      expect(createQuery!.sql).toContain('DEFAULT TRUE');
+      expect(createQuery!.sql).toContain('DEFAULT 0');
+    });
+
+    it('releases client on error', async () => {
+      mockClient.query.mockRejectedValueOnce(new Error('already exists'));
+      await expect(
+        postgres.createTable(conn, 'public', 'dup', [{ name: 'id', type: 'serial', nullable: false }])
+      ).rejects.toThrow('already exists');
+      expect(mockClient.release).toHaveBeenCalled();
+    });
+  });
+
+  describe('exportTableParquet', () => {
+    it('queries the table and returns row count', async () => {
+      const mockWriter = { appendRow: vi.fn().mockResolvedValue(undefined), close: vi.fn().mockResolvedValue(undefined) };
+      vi.doMock('parquetjs-lite', () => ({
+        ParquetSchema: vi.fn(),
+        ParquetWriter: { openFile: vi.fn().mockResolvedValue(mockWriter) },
+      }));
+
+      queryResponses.set('SELECT * FROM "public"."users"', {
+        rows: [{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }],
+        fields: [
+          { name: 'id', dataTypeID: 23 },
+          { name: 'name', dataTypeID: 25 },
+        ] as never,
+      });
+
+      const count = await postgres.exportTableParquet(conn, 'public', 'users', '/tmp/test.parquet');
+      expect(count).toBe(2);
+      expect(mockClient.release).toHaveBeenCalled();
     });
   });
 });

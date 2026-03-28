@@ -111,9 +111,7 @@ export function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('test-connection', async (_event, connection: ConnectionInput) => {
-    console.log('[test-connection] received:', JSON.stringify(connection));
     const saved = toSavedConnection(connection);
-    console.log('[test-connection] connectionString:', buildConnectionString(saved));
     await postgres.testConnection(saved);
     return { success: true };
   });
@@ -322,7 +320,13 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('update-backup-schedule', (_event, id: string, updates: Record<string, unknown>) => {
     const schedules = loadSchedules();
     const idx = schedules.findIndex((s) => s.id === id);
-    if (idx >= 0) { Object.assign(schedules[idx], updates); saveSchedules(schedules); }
+    if (idx >= 0) {
+      for (const [key, value] of Object.entries(updates)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+        (schedules[idx] as Record<string, unknown>)[key] = value;
+      }
+      saveSchedules(schedules);
+    }
     return schedules;
   });
 

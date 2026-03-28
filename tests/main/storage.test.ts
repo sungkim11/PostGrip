@@ -14,7 +14,7 @@ vi.mock('node:fs', () => ({
 }));
 
 import fs from 'node:fs';
-import { loadConnections, saveConnections } from '../../src/main/storage';
+import { loadConnections, saveConnections, saveLastConnectionId, loadLastConnectionId } from '../../src/main/storage';
 
 describe('storage', () => {
   const mockConnections: SavedConnection[] = [
@@ -88,6 +88,51 @@ describe('storage', () => {
       saveConnections([]);
       const content = vi.mocked(fs.writeFileSync).mock.calls[0][1] as string;
       expect(JSON.parse(content)).toEqual([]);
+    });
+  });
+
+  describe('saveLastConnectionId', () => {
+    it('writes connection id to file', () => {
+      saveLastConnectionId('conn-123');
+      expect(fs.writeFileSync).toHaveBeenCalledTimes(1);
+      const [filePath, content, encoding] = vi.mocked(fs.writeFileSync).mock.calls[0];
+      expect(filePath).toContain('last_connection.txt');
+      expect(content).toBe('conn-123');
+      expect(encoding).toBe('utf-8');
+    });
+
+    it('overwrites previous id', () => {
+      saveLastConnectionId('conn-1');
+      saveLastConnectionId('conn-2');
+      const content = vi.mocked(fs.writeFileSync).mock.calls[1][1] as string;
+      expect(content).toBe('conn-2');
+    });
+  });
+
+  describe('loadLastConnectionId', () => {
+    it('returns id from file', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('conn-123');
+      const result = loadLastConnectionId();
+      expect(result).toBe('conn-123');
+    });
+
+    it('trims whitespace', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('  conn-123  \n');
+      const result = loadLastConnectionId();
+      expect(result).toBe('conn-123');
+    });
+
+    it('returns null when file does not exist', () => {
+      vi.mocked(fs.readFileSync).mockImplementation(() => { throw new Error('ENOENT'); });
+      const result = loadLastConnectionId();
+      expect(result).toBeNull();
+    });
+
+    it('reads from correct file path', () => {
+      vi.mocked(fs.readFileSync).mockReturnValue('x');
+      loadLastConnectionId();
+      const readPath = vi.mocked(fs.readFileSync).mock.calls[0][0] as string;
+      expect(readPath).toContain('last_connection.txt');
     });
   });
 });

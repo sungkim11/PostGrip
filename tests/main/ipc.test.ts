@@ -25,6 +25,9 @@ vi.mock('../../src/main/postgres', () => ({
   getModifyTableInfo: vi.fn().mockResolvedValue({ schema: 'public', table: 'test', columns: [] }),
   alterTable: vi.fn().mockResolvedValue(undefined),
   exportTableCsv: vi.fn().mockResolvedValue(0),
+  exportTableParquet: vi.fn().mockResolvedValue(10),
+  createSchema: vi.fn().mockResolvedValue(undefined),
+  createTable: vi.fn().mockResolvedValue(undefined),
   executeSql: vi.fn().mockResolvedValue(undefined),
   closeAllPools: vi.fn(),
 }));
@@ -125,6 +128,9 @@ describe('IPC handlers', () => {
       'get-modify-table-info',
       'alter-table',
       'export-table-csv',
+      'export-table-parquet',
+      'create-schema',
+      'create-table',
       'export-pg-dump',
       'show-save-dialog',
       'write-file',
@@ -601,6 +607,81 @@ describe('IPC handlers', () => {
       const result = await invoke('read-help') as string;
       expect(typeof result).toBe('string');
       expect(result.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('export-table-parquet', () => {
+    it('throws without connection', async () => {
+      await expect(invoke('export-table-parquet', 'public', 'users', '/tmp/out.parquet')).rejects.toThrow('No active database connection');
+    });
+
+    it('delegates to postgres.exportTableParquet', async () => {
+      appState.activeConnection = {
+        id: '1', name: 'test', host: 'localhost', port: 5432, user: 'pg', password: 'pw', database: 'db',
+      };
+      const result = await invoke('export-table-parquet', 'public', 'users', '/tmp/out.parquet');
+      expect(postgres.exportTableParquet).toHaveBeenCalledWith(appState.activeConnection, 'public', 'users', '/tmp/out.parquet');
+      expect(result).toBe(10);
+    });
+  });
+
+  describe('create-schema', () => {
+    it('throws without connection', async () => {
+      await expect(invoke('create-schema', 'new_schema')).rejects.toThrow('No active database connection');
+    });
+
+    it('creates schema and returns snapshot', async () => {
+      appState.activeConnection = {
+        id: '1', name: 'test', host: 'localhost', port: 5432, user: 'pg', password: 'pw', database: 'db',
+      };
+      const result = await invoke('create-schema', 'my_schema') as { databaseTree: unknown };
+      expect(postgres.createSchema).toHaveBeenCalledWith(appState.activeConnection, 'my_schema');
+      expect(result).toHaveProperty('databaseTree');
+    });
+  });
+
+  describe('create-table', () => {
+    it('throws without connection', async () => {
+      const cols = [{ name: 'id', type: 'serial', nullable: false }];
+      await expect(invoke('create-table', 'public', 'new_table', cols)).rejects.toThrow('No active database connection');
+    });
+
+    it('creates table and returns snapshot', async () => {
+      appState.activeConnection = {
+        id: '1', name: 'test', host: 'localhost', port: 5432, user: 'pg', password: 'pw', database: 'db',
+      };
+      const cols = [{ name: 'id', type: 'serial', nullable: false, pk: true }];
+      const fks = [{ column: 'user_id', refTable: 'public.users', refColumn: 'id' }];
+      const idxs = [{ columns: 'id', unique: true }];
+      const result = await invoke('create-table', 'public', 'orders', cols, fks, idxs) as { databaseTree: unknown };
+      expect(postgres.createTable).toHaveBeenCalledWith(appState.activeConnection, 'public', 'orders', cols, fks, idxs);
+      expect(result).toHaveProperty('databaseTree');
+    });
+
+    it('works without optional foreignKeys and indexes', async () => {
+      appState.activeConnection = {
+        id: '1', name: 'test', host: 'localhost', port: 5432, user: 'pg', password: 'pw', database: 'db',
+      };
+      const cols = [{ name: 'id', type: 'serial', nullable: false }];
+      await invoke('create-table', 'public', 'simple', cols);
+      expect(postgres.createTable).toHaveBeenCalledWith(appState.activeConnection, 'public', 'simple', cols, undefined, undefined);
+    });
+  });
+
+  describe('update-backup-schedule prototype pollution protection', () => {
+    it('ignores __proto__ keys in updates', async () => {
+      const fsModule = await import('node:fs');
+      vi.mocked(fsModule.default.readFileSync).mockReturnValue(JSON.stringify([{ id: 's1', time: '02:00' }]));
+      const result = await invoke('update-backup-schedule', 's1', { __proto__: { polluted: true }, time: '05:00' }) as Array<{ id: string; time: string }>;
+      expect(result[0].time).toBe('05:00');
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+
+    it('ignores constructor key in updates', async () => {
+      const fsModule = await import('node:fs');
+      vi.mocked(fsModule.default.readFileSync).mockReturnValue(JSON.stringify([{ id: 's1', time: '02:00' }]));
+      await invoke('update-backup-schedule', 's1', { constructor: 'bad', time: '06:00' });
+      expect(({} as Record<string, unknown>).constructor).toBe(Object);
     });
   });
 });

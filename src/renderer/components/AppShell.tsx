@@ -701,9 +701,8 @@ export function AppShell() {
     setShowCreateSchemaModal(false);
     try {
       setLoading(`Creating schema ${schemaName}...`);
-      await api.createSchema(schemaName);
-      const refreshed = await api.bootstrap();
-      setSnapshot(refreshed);
+      const next = await api.createSchema(schemaName);
+      setSnapshot(next);
       setLoading('');
     } catch (err) {
       setLoading('');
@@ -715,10 +714,8 @@ export function AppShell() {
     setShowCreateTableModal(false);
     try {
       setLoading(`Creating table ${schema}.${tableName}...`);
-      await api.createTable(schema, tableName, columns, foreignKeys, indexes);
-      // Refresh tree separately to ensure we see the new table
-      const refreshed = await api.bootstrap();
-      setSnapshot(refreshed);
+      const next = await api.createTable(schema, tableName, columns, foreignKeys, indexes);
+      setSnapshot(next);
       setLoading('');
     } catch (err) {
       setLoading('');
@@ -1529,7 +1526,6 @@ export function AppShell() {
     if (rawActions.length === 0) return '-- No changes';
     // Show rename last to match execution order
     const actions = [...rawActions.filter((a) => a.type !== 'rename_table'), ...rawActions.filter((a) => a.type === 'rename_table')];
-    const qi = (v: string) => `"${v.replace(/"/g, '""')}"`;
     const qt = `${qi(modifyTableInfo.schema)}.${qi(modifyTableInfo.table)}`;
     return actions.map((a) => {
       switch (a.type) {
@@ -1561,6 +1557,14 @@ export function AppShell() {
     }).join('\n');
   }, [modifyTableInfo, modifyTableDraft]);
 
+  const modifyAllCols = useMemo(() => {
+    if (!modifyTableInfo) return [];
+    return [
+      ...modifyTableDraft.columns.filter((c) => !modifyTableDraft.dropColumns.has(modifyTableInfo.columns[modifyTableDraft.columns.indexOf(c)]?.name ?? '')).map((c) => c.name),
+      ...modifyTableDraft.addColumns.filter((c) => c.name.trim()).map((c) => c.name.trim()),
+    ];
+  }, [modifyTableInfo, modifyTableDraft]);
+
   async function handleApplyModifyTable() {
     if (!modifyTableInfo) return;
     const actions = buildModifyActions();
@@ -1575,7 +1579,6 @@ export function AppShell() {
     try {
       setLoading('Applying table modifications...');
       setModifyTableError('');
-      const qi = (v: string) => `"${v.replace(/"/g, '""')}"`;
       const qt = `${qi(modifyTableInfo.schema)}.${qi(modifyTableInfo.table)}`;
 
       if (actions.length > 0) {
@@ -1583,14 +1586,17 @@ export function AppShell() {
       }
       // Add foreign keys
       for (const fk of fks) {
-        await api.runQuery(`ALTER TABLE ${qt} ADD FOREIGN KEY (${qi(fk.column)}) REFERENCES ${fk.refTable} (${qi(fk.refColumn)})`);
+        const refParts = fk.refTable.includes('.') ? fk.refTable.split('.', 2) : [fk.refTable];
+        const quotedRef = refParts.map((p) => qi(p.trim())).join('.');
+        await api.runQuery(`ALTER TABLE ${qt} ADD FOREIGN KEY (${qi(fk.column)}) REFERENCES ${quotedRef} (${qi(fk.refColumn)})`);
       }
       // Add indexes
       for (const idx of idxs) {
         const tableName = modifyTableDraft.newTableName || modifyTableInfo.table;
         const idxName = idx.name.trim() || `idx_${tableName}_${idx.columns.trim().replace(/,\s*/g, '_')}`;
         const unique = idx.unique ? 'UNIQUE ' : '';
-        await api.runQuery(`CREATE ${unique}INDEX ${qi(idxName)} ON ${qt} (${idx.columns.trim()})`);
+        const quotedCols = idx.columns.split(',').map((c) => qi(c.trim())).join(', ');
+        await api.runQuery(`CREATE ${unique}INDEX ${qi(idxName)} ON ${qt} (${quotedCols})`);
       }
 
       const refreshed = await api.bootstrap();
@@ -2431,14 +2437,13 @@ export function AppShell() {
                     {modifyTableDraft.addForeignKeys.length === 0 ? (
                       <tr><td colSpan={6} className="px-2 py-1.5 text-[11px] text-gray-400">No new foreign keys</td></tr>
                     ) : modifyTableDraft.addForeignKeys.map((fk, i) => {
-                      const allCols = [...modifyTableDraft.columns.filter((c) => !modifyTableDraft.dropColumns.has(modifyTableInfo.columns[modifyTableDraft.columns.indexOf(c)]?.name ?? '')).map((c) => c.name), ...modifyTableDraft.addColumns.filter((c) => c.name.trim()).map((c) => c.name.trim())];
                       const ref = fk.refTable.trim();
                       const parts = ref.includes('.') ? ref.split('.') : [modifyTableInfo.schema, ref];
                       const refSchema = databaseTree.find((s) => s.name === parts[0]);
                       const refTable = refSchema?.tables.find((t) => t.name === parts[1]);
                       return (
                         <tr key={`mfk-${i}`} className="border-b border-black/5 bg-emerald-50/30">
-                          <td className="px-1 py-1"><select className="input py-1 text-[12px]" value={fk.column} onChange={(e) => setModifyTableDraft((d) => { const fks = [...d.addForeignKeys]; fks[i] = { ...fks[i], column: e.target.value }; return { ...d, addForeignKeys: fks }; })}><option value="">Source Column</option>{allCols.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
+                          <td className="px-1 py-1"><select className="input py-1 text-[12px]" value={fk.column} onChange={(e) => setModifyTableDraft((d) => { const fks = [...d.addForeignKeys]; fks[i] = { ...fks[i], column: e.target.value }; return { ...d, addForeignKeys: fks }; })}><option value="">Source Column</option>{modifyAllCols.map((c) => <option key={c} value={c}>{c}</option>)}</select></td>
                           <td className="px-1 py-1">
                             <select className="input py-1 text-[12px]" value={fk.refTable} onChange={(e) => setModifyTableDraft((d) => { const fks = [...d.addForeignKeys]; fks[i] = { ...fks[i], refTable: e.target.value }; return { ...d, addForeignKeys: fks }; })}>
                               <option value="">Reference Table</option>
@@ -2464,11 +2469,10 @@ export function AppShell() {
                     {modifyTableDraft.addIndexes.length === 0 ? (
                       <tr><td colSpan={6} className="px-2 py-1.5 text-[11px] text-gray-400">No new indexes</td></tr>
                     ) : modifyTableDraft.addIndexes.map((idx, i) => {
-                      const allCols = [...modifyTableDraft.columns.filter((c) => !modifyTableDraft.dropColumns.has(modifyTableInfo.columns[modifyTableDraft.columns.indexOf(c)]?.name ?? '')).map((c) => c.name), ...modifyTableDraft.addColumns.filter((c) => c.name.trim()).map((c) => c.name.trim())];
                       return (
                         <tr key={`midx-${i}`} className="border-b border-black/5 bg-emerald-50/30">
                           <td className="px-1 py-1"><input className="input py-1 text-[12px]" value={idx.name} onChange={(e) => setModifyTableDraft((d) => { const idxs = [...d.addIndexes]; idxs[i] = { ...idxs[i], name: e.target.value }; return { ...d, addIndexes: idxs }; })} placeholder="auto-generated" /></td>
-                          <td className="px-1 py-1"><IndexColumnPicker availableColumns={allCols} selected={idx.columns} onChange={(val) => setModifyTableDraft((d) => { const idxs = [...d.addIndexes]; idxs[i] = { ...idxs[i], columns: val }; return { ...d, addIndexes: idxs }; })} /></td>
+                          <td className="px-1 py-1"><IndexColumnPicker availableColumns={modifyAllCols} selected={idx.columns} onChange={(val) => setModifyTableDraft((d) => { const idxs = [...d.addIndexes]; idxs[i] = { ...idxs[i], columns: val }; return { ...d, addIndexes: idxs }; })} /></td>
                           <td className="px-1 py-1 text-center"><input type="checkbox" checked={idx.unique} onChange={(e) => setModifyTableDraft((d) => { const idxs = [...d.addIndexes]; idxs[i] = { ...idxs[i], unique: e.target.checked }; return { ...d, addIndexes: idxs }; })} /></td>
                           <td colSpan={2} />
                           <td className="px-1 py-1 text-center"><button className="text-red-400 hover:text-red-600" onClick={() => setModifyTableDraft((d) => ({ ...d, addIndexes: d.addIndexes.filter((_, j) => j !== i) }))} type="button">&times;</button></td>
@@ -2483,7 +2487,6 @@ export function AppShell() {
               <div className="overflow-hidden rounded-lg border border-black/10">
                 <div className="px-3 py-1.5 text-[12px] font-semibold text-black">DDL Preview</div>
                 <pre className="overflow-x-auto border-t border-black/10 bg-gray-50 p-3 font-mono text-[11px] leading-relaxed text-black whitespace-pre-wrap">{(() => {
-                  const qi = (v: string) => `"${v.replace(/"/g, '""')}"`;
                   const tableName = modifyTableDraft.newTableName || modifyTableInfo.table;
                   const qt = `${qi(modifyTableInfo.schema)}.${qi(tableName)}`;
 
@@ -3117,6 +3120,8 @@ function BackupTable({ entries, onDelete, onRestore }: {
     </table>
   );
 }
+
+function qi(v: string) { return `"${v.replace(/"/g, '""')}"`; }
 
 const COMMON_TYPES = ['serial', 'bigserial', 'integer', 'bigint', 'smallint', 'text', 'varchar(255)', 'boolean', 'timestamp', 'timestamptz', 'date', 'numeric', 'real', 'double precision', 'uuid', 'jsonb', 'json', 'bytea'];
 const ALL_DAYS = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'] as const;

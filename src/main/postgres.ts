@@ -47,6 +47,35 @@ function quoteIdentifier(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
+/** Split a comma-separated column list and quote each identifier */
+export function quoteColumnList(columns: string): string {
+  return columns.split(',').map((c) => quoteIdentifier(c.trim())).filter(Boolean).join(', ');
+}
+
+/** Quote a possibly schema-qualified table name (e.g. "public.users") */
+export function quoteTableRef(ref: string): string {
+  const parts = ref.includes('.') ? ref.split('.', 2) : [ref];
+  return parts.map((p) => quoteIdentifier(p.trim())).join('.');
+}
+
+const SAFE_DEFAULT_RE = /^(?:'(?:[^']*(?:'')*)*'|NULL|TRUE|FALSE|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|NOW\(\)|(?:\d+\.?\d*(?:e[+-]?\d+)?)|nextval\([^)]+\)|gen_random_uuid\(\))$/i;
+
+export function validateDefault(val: string): string {
+  if (!SAFE_DEFAULT_RE.test(val.trim())) {
+    throw new Error(`Unsafe DEFAULT expression: ${val}`);
+  }
+  return val.trim();
+}
+
+const VALID_TYPE_RE = /^[a-z][a-z0-9_ ]*(?:\(\d+(?:,\s*\d+)?\))?(?:\[\])?$/i;
+
+export function validateDataType(val: string): string {
+  if (!VALID_TYPE_RE.test(val.trim())) {
+    throw new Error(`Invalid data type: ${val}`);
+  }
+  return val.trim();
+}
+
 /** Convert a JS array to PostgreSQL array literal format: {a,b,"c with spaces"} */
 function toPgArrayLiteral(arr: unknown[]): string {
   const elements = arr.map((el) => {
@@ -445,9 +474,9 @@ export async function createTable(conn: SavedConnection, schema: string, tableNa
     const qt = `${quoteIdentifier(schema)}.${quoteIdentifier(tableName)}`;
     const lines: string[] = [];
     for (const c of columns) {
-      let def = `${quoteIdentifier(c.name)} ${c.type}`;
+      let def = `${quoteIdentifier(c.name)} ${validateDataType(c.type)}`;
       if (!c.nullable) def += ' NOT NULL';
-      if (c.defaultValue) def += ` DEFAULT ${c.defaultValue}`;
+      if (c.defaultValue) def += ` DEFAULT ${validateDefault(c.defaultValue)}`;
       lines.push(def);
     }
     const pkCols = columns.filter((c) => c.pk);
@@ -457,7 +486,7 @@ export async function createTable(conn: SavedConnection, schema: string, tableNa
     if (foreignKeys) {
       for (const fk of foreignKeys) {
         if (fk.column && fk.refTable && fk.refColumn) {
-          lines.push(`FOREIGN KEY (${quoteIdentifier(fk.column)}) REFERENCES ${fk.refTable} (${quoteIdentifier(fk.refColumn)})`);
+          lines.push(`FOREIGN KEY (${quoteIdentifier(fk.column)}) REFERENCES ${quoteTableRef(fk.refTable)} (${quoteIdentifier(fk.refColumn)})`);
         }
       }
     }
@@ -467,7 +496,7 @@ export async function createTable(conn: SavedConnection, schema: string, tableNa
         if (idx.columns) {
           const idxName = idx.name || `idx_${tableName}_${idx.columns.replace(/,\s*/g, '_')}`;
           const unique = idx.unique ? 'UNIQUE ' : '';
-          await client.query(`CREATE ${unique}INDEX ${quoteIdentifier(idxName)} ON ${qt} (${idx.columns})`);
+          await client.query(`CREATE ${unique}INDEX ${quoteIdentifier(idxName)} ON ${qt} (${quoteColumnList(idx.columns)})`);
         }
       }
     }
@@ -643,11 +672,11 @@ export async function runQuery(
     const started = performance.now();
     const fetchLimit = limit + 1;
     const trimmed = sql.trim().replace(/;+$/, '');
-    const limitedSql = `SELECT * FROM (${trimmed}) AS _rdb2_sub LIMIT ${fetchLimit}`;
+    const limitedSql = `SELECT * FROM (${trimmed}) AS _rdb2_sub LIMIT $1`;
 
     let result: pg.QueryResult;
     try {
-      result = await client.query(limitedSql);
+      result = await client.query(limitedSql, [fetchLimit]);
     } catch {
       // If wrapped query fails (DDL/DML), try original SQL directly
       result = await client.query(sql);
@@ -755,7 +784,7 @@ export async function getEditableTableData(
     const countRes = await client.query(`SELECT count(*)::int AS cnt FROM ${qt}`);
     const totalCount: number = countRes.rows[0].cnt;
 
-    const dataRes = await client.query(`SELECT * FROM ${qt} LIMIT ${limit} OFFSET ${offset}`);
+    const dataRes = await client.query(`SELECT * FROM ${qt} LIMIT $1 OFFSET $2`, [limit, offset]);
     const columns = dataRes.fields?.map((f) => f.name) ?? [];
     const columnTypes: string[] = [];
 
@@ -941,7 +970,7 @@ export async function previewTable(
   limit: number,
   offset: number,
 ): Promise<QueryResult> {
-  const sql = `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} LIMIT ${limit} OFFSET ${offset}`;
+  const sql = `SELECT * FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)} LIMIT ${Number(limit)} OFFSET ${Number(offset)}`;
   return runQuery(conn, sql, limit);
 }
 
@@ -1116,9 +1145,9 @@ export async function alterTable(
     for (const action of schemaActions) {
       switch (action.type) {
         case 'add_column': {
-          let sql = `ALTER TABLE ${qualifiedTable} ADD COLUMN ${quoteIdentifier(action.columnName!)} ${action.dataType!}`;
+          let sql = `ALTER TABLE ${qualifiedTable} ADD COLUMN ${quoteIdentifier(action.columnName!)} ${validateDataType(action.dataType!)}`;
           if (!action.nullable) sql += ' NOT NULL';
-          if (action.defaultValue) sql += ` DEFAULT ${action.defaultValue}`;
+          if (action.defaultValue) sql += ` DEFAULT ${validateDefault(action.defaultValue)}`;
           sqls.push(sql);
           break;
         }
@@ -1129,7 +1158,7 @@ export async function alterTable(
           sqls.push(`ALTER TABLE ${qualifiedTable} RENAME COLUMN ${quoteIdentifier(action.columnName!)} TO ${quoteIdentifier(action.newColumnName!)}`);
           break;
         case 'alter_type':
-          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} TYPE ${action.dataType!}`);
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} TYPE ${validateDataType(action.dataType!)}`);
           break;
         case 'set_not_null':
           sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} SET NOT NULL`);
@@ -1138,7 +1167,7 @@ export async function alterTable(
           sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} DROP NOT NULL`);
           break;
         case 'set_default':
-          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} SET DEFAULT ${action.defaultValue!}`);
+          sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} SET DEFAULT ${validateDefault(action.defaultValue!)}`);
           break;
         case 'drop_default':
           sqls.push(`ALTER TABLE ${qualifiedTable} ALTER COLUMN ${quoteIdentifier(action.columnName!)} DROP DEFAULT`);
