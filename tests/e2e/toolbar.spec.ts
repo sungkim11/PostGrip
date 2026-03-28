@@ -15,8 +15,11 @@ test.afterAll(async () => {
 
 test.describe('Toolbar and Menus', () => {
   test('menu buttons exist', async () => {
-    await expect(page.locator('button', { hasText: 'File' })).toBeVisible();
-    await expect(page.locator('button', { hasText: 'View' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'File', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'SQL Editor', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Monitoring', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Backup & Restore', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Help', exact: true })).toBeVisible();
   });
 
   test('SQL Editor button opens editor', async () => {

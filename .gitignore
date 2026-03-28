@@ -6,3 +6,4 @@ release/
 .env
 test-results/
 playwright-report/
+coverage/

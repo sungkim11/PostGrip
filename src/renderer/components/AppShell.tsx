@@ -189,9 +189,10 @@ export function AppShell() {
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'fail'>('idle');
   const [connectionTab, setConnectionTab] = useState<'general' | 'ssh'>('general');
   const [testError, setTestError] = useState('');
-  const [showMonitoringPanel, setShowMonitoringPanel] = useState(false);
+  const [activePanel, setActivePanel] = useState<'monitoring' | 'backup' | null>(null);
+  const showMonitoringPanel = activePanel === 'monitoring';
+  const showBackupPanel = activePanel === 'backup';
   const [monitoringData, setMonitoringData] = useState<MonitoringData | null>(null);
-  const [showBackupPanel, setShowBackupPanel] = useState(false);
   const [showBackupModal, setShowBackupModal] = useState(false);
   const [runningBackup, setRunningBackup] = useState<{ name: string; startTime: number } | null>(null);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
@@ -257,8 +258,7 @@ export function AppShell() {
 
   function openSqlEditor() {
     setShowSqlEditor(true);
-    setShowMonitoringPanel(false);
-    setShowBackupPanel(false);
+    setActivePanel(null);
     if (sqlTabs.length === 0) addSqlTab();
   }
 
@@ -536,9 +536,8 @@ export function AppShell() {
   }
 
   async function openMonitoringPanel() {
-    if (showMonitoringPanel) { setShowMonitoringPanel(false); return; }
-    setShowMonitoringPanel(true);
-    setShowBackupPanel(false);
+    if (showMonitoringPanel) { setActivePanel(null); return; }
+    setActivePanel('monitoring');
     if (!snapshot?.activeConnection) return;
     try {
       const data = await api.monitoringData();
@@ -555,9 +554,8 @@ export function AppShell() {
   }
 
   async function openBackupPanel() {
-    if (showBackupPanel) { setShowBackupPanel(false); return; }
-    setShowBackupPanel(true);
-    setShowMonitoringPanel(false);
+    if (showBackupPanel) { setActivePanel(null); return; }
+    setActivePanel('backup');
     try {
       const dir = await api.getBackupDir();
       setBackupDir(dir);
@@ -1001,8 +999,7 @@ export function AppShell() {
   }
 
   async function handlePreviewTable(schema: string, table: string) {
-    setShowMonitoringPanel(false);
-    setShowBackupPanel(false);
+    setActivePanel(null);
     try {
       setLoading(`Loading ${schema}.${table}...`);
       setError(null);
@@ -1804,7 +1801,7 @@ export function AppShell() {
                   <div className="text-[13px] font-medium text-black">Monitoring</div>
                   <div className="flex items-center gap-2">
                     <button className="px-1 py-0.5 text-[12px] leading-tight text-gray-500 hover:text-black" onClick={() => void refreshMonitoring()} type="button">Refresh</button>
-                    <button className="px-1 py-0.5 text-[12px] leading-tight text-gray-500 hover:text-black" onClick={() => setShowMonitoringPanel(false)} type="button">Close</button>
+                    <button className="px-1 py-0.5 text-[12px] leading-tight text-gray-500 hover:text-black" onClick={() => setActivePanel(null)} type="button">Close</button>
                   </div>
                 </div>
                 <div className="min-h-0 flex-1 overflow-y-auto rounded-b-xl bg-white">
@@ -1820,7 +1817,7 @@ export function AppShell() {
               <div className="glass-panel flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl">
                 <div className="flex h-7 items-center justify-between border-b border-black/5 px-3">
                   <div className="text-[13px] font-medium text-black">Backup & Restore</div>
-                  <button className="px-1 py-0.5 text-[12px] leading-tight text-gray-500 hover:text-black" onClick={() => setShowBackupPanel(false)} type="button">Close</button>
+                  <button className="px-1 py-0.5 text-[12px] leading-tight text-gray-500 hover:text-black" onClick={() => setActivePanel(null)} type="button">Close</button>
                 </div>
                 <div className="flex min-h-0 flex-1 flex-col rounded-b-xl bg-white">
                   <div className="flex items-center gap-3 border-b border-black/5 px-3 py-2">

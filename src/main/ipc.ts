@@ -18,12 +18,16 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
 
 const execFileAsync = promisify(execFile);
 
+const pgToolCache = new Map<string, string>();
 function findPgTool(name: string): string {
+  const cached = pgToolCache.get(name);
+  if (cached) return cached;
   const candidates = [
-    name, // PATH
+    name,
     `/opt/homebrew/bin/${name}`,
     `/opt/homebrew/opt/libpq/bin/${name}`,
     `/usr/local/bin/${name}`,
@@ -35,10 +39,11 @@ function findPgTool(name: string): string {
   for (const c of candidates) {
     try {
       fs.accessSync(c, fs.constants.X_OK);
+      pgToolCache.set(name, c);
       return c;
     } catch { /* try next */ }
   }
-  return name; // fall back to bare name, let it fail with a clear error
+  return name;
 }
 
 function snapshot(): AppSnapshot {
@@ -225,27 +230,17 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('list-backups', async (_event, dirPath: string) => {
     try {
       const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
-      const backups: Array<{ name: string; path: string; size: number; modified: string; meta?: Record<string, unknown> }> = [];
-      for (const e of entries) {
-        if (!e.isFile()) continue;
-        if (!/\.(sql|dump|tar)$/i.test(e.name)) continue;
+      const backupFiles = entries.filter((e) => e.isFile() && /\.(sql|dump|tar)$/i.test(e.name));
+      const backups = (await Promise.all(backupFiles.map(async (e) => {
         try {
           const fullPath = path.join(dirPath, e.name);
-          const stat = await fs.promises.stat(fullPath);
-          let meta: Record<string, unknown> | undefined;
-          try {
-            const metaContent = await fs.promises.readFile(fullPath + '.meta.json', 'utf-8');
-            meta = JSON.parse(metaContent);
-          } catch { /* no metadata */ }
-          backups.push({
-            name: e.name,
-            path: fullPath,
-            size: stat.size,
-            modified: stat.mtime.toISOString(),
-            meta,
-          });
-        } catch { /* skip */ }
-      }
+          const [stat, meta] = await Promise.all([
+            fs.promises.stat(fullPath),
+            fs.promises.readFile(fullPath + '.meta.json', 'utf-8').then((c) => JSON.parse(c)).catch(() => undefined),
+          ]);
+          return { name: e.name, path: fullPath, size: stat.size, modified: stat.mtime.toISOString(), meta };
+        } catch { return null; }
+      }))).filter((b): b is NonNullable<typeof b> => b !== null);
       backups.sort((a, b) => b.modified.localeCompare(a.modified));
       return backups;
     } catch {
@@ -279,7 +274,7 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle('add-backup-schedule', (_event, schedule: Record<string, unknown>) => {
     const schedules = loadSchedules();
-    schedule.id = require('node:crypto').randomUUID();
+    schedule.id = randomUUID();
     schedule.createdAt = new Date().toISOString();
     schedules.push(schedule);
     saveSchedules(schedules);
@@ -303,6 +298,7 @@ export function registerIpcHandlers(): void {
   setInterval(async () => {
     if (!appState.activeConnection) return;
     const schedules = loadSchedules();
+    if (schedules.length === 0) return;
     const now = new Date();
     const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
     const currentDay = dayNames[now.getDay()];

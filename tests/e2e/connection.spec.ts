@@ -29,7 +29,7 @@ test.describe('Connection Modal - General Tab', () => {
     await expect(page.getByText('Port', { exact: true })).toBeVisible();
     await expect(page.getByText('Authentication', { exact: true })).toBeVisible();
     await expect(page.getByText('User', { exact: true })).toBeVisible();
-    await expect(page.getByText('Database', { exact: true })).toBeVisible();
+    await expect(page.locator('.glass-panel-strong').getByText('Database', { exact: true })).toBeVisible();
     await expect(page.getByText('URL', { exact: true })).toBeVisible();
   });
 
