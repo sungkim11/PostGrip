@@ -42,6 +42,11 @@ function getPool(conn: SavedConnection, host: string, port: number, password: st
   if (password) config.password = password;
 
   pool = new pg.Pool(config);
+  // Handle errors on idle clients to prevent uncaught exceptions when the
+  // server drops a connection (e.g. timeout, restart, network blip).
+  pool.on('error', (err) => {
+    console.error(`Pool idle client error [${key}]:`, err.message);
+  });
   pools.set(key, pool);
   return pool;
 }
