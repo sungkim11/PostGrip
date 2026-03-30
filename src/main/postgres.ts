@@ -737,7 +737,9 @@ export async function runQuery(
     try {
       result = await client.query(limitedSql, [fetchLimit]);
     } catch {
-      // If wrapped query fails (DDL/DML), try original SQL directly
+      // If wrapped query fails (DDL/DML), clear the aborted transaction
+      // state before retrying with the original SQL directly
+      await client.query('ROLLBACK');
       result = await client.query(sql);
     }
 
